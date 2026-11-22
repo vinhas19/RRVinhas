@@ -1,0 +1,12 @@
+﻿payload folder: F:\Game Dev\Rob Run\RRTool_Public_NoKey\1_run\payload
+Felonious Funnery  —  Rob Run
+hypervisor present : no
+VBS registry       : not set
+memory integrity   : disabled
+credential guard   : not set
+virtualization check passed
+settings: menu_delay=5 menu_wait_window=1 attach_timeout=120 reattach_attempts=3 hide_launcher=0 masquerade=1
+extracted RobRunPort.exe (2375168 bytes)
+kernel-mode.sys SHA256 5bbe7abb3e60e176195db2989704d863791df300219c3f13938117335319b2d1
+driver is already mapped in this session; skipping kd2.exe
+driver ready (Key 0xCC2D36C9)
