@@ -83,6 +83,118 @@ static HRESULT navigate_menu(ICoreWebView2* webview) {
 static void jcat_int(std::string& s, const char* k, int v, bool first=false){
     char b[96]; snprintf(b,sizeof(b),"%s\"%s\":%d", first?"":",",k,v); s+=b;
 }
+
+/* Default palette. Index order matches BR_ColorId; 0..14 are the historical
+ * values, the appended slots copy the colours that used to be hard-coded at
+ * their draw sites. Used by br_get() and by act:reset_colors. */
+static const unsigned char g_default_colors[][3] = {
+    { 86,168,255}, {255, 86, 86}, {120,255,140}, { 86,255,246},
+    {158,158,158}, {255,255,255}, {255,255,255}, {255,255,255},
+    {255,255,255}, {255,255,255}, {255,255,255}, {120,255,140},
+    {255,176, 66}, {139, 92,246}, {220,220,220},                 /* 0..14 */
+    {255,255,255}, {255,255,255},                                /* health, crouch */
+    { 86,168,255}, { 86,168,255}, { 86,168,255},                 /* skel, cham, box */
+    {230,224,245}, {255,214,110}, {235,235,235},                 /* radar bg, vehicle, loot */
+    {230,230,230}, {230,230,230}, {111,232,145},                 /* loot none, common, uncommon */
+    {105,178,255}, {211,155,255}, {255,190, 92},                 /* rare, epic, legendary */
+    {255,113,149},                                               /* exotic */
+    {255,214,110}, {255,181, 65},                                /* vehicle marker, cham */
+    {227,215,252},                                               /* self status */
+    {255,190, 92}, {200,200,200}, {111,232,145}, {105,178,255},   /* container, door, dropped, vehicle loot */
+    {201,155,255},                                               /* radar loot node */
+    {180, 92,255}                                                /* hiding objects (World tab) */
+};
+
+/* Tripwire: the table above is positional and appends only, so catching a
+ * missing row here beats tracking down a zero-filled colour in game. */
+typedef char br_default_color_count_check[
+    (sizeof(g_default_colors) / sizeof(g_default_colors[0]) == BR_COLOR_COUNT) ? 1 : -1];
+
+/* UI accent colours. The menu page paints itself from these; the renderer
+ * never reads them. Used by br_get(), act:reset_colors and the state JSON. */
+static const unsigned char g_default_accent[3]    = {180, 92, 255};
+static const unsigned char g_default_secondary[3] = {255, 92, 174};
+
+static const char* const g_role_color_keys[BR_ROLE_COLOR_COUNT] = {
+    "cop", "robber", "hubber", "civilian", "citizen", "clan", "police"
+};
+
+/* Fixed role colours mirrored from rr_draw.c; legend only. */
+static const unsigned char g_role_colors[BR_ROLE_COLOR_COUNT][3] = {
+    { 90,170,255}, {255, 86, 86}, {220,220,220}, {220,220,220},
+    {200,230,200}, {218,153,255}, { 86,255,246}
+};
+
+typedef struct {
+    const char* key;
+    int id;
+} COLOR_KEY;
+
+static const COLOR_KEY g_color_keys[] = {
+    { "marker",         BR_COL_MARKER },
+    { "downed",         BR_COL_DOWNED },
+    { "name",           BR_COL_NAME },
+    { "weapon",         BR_COL_WEAPON },
+    { "dist",           BR_COL_DIST },
+    { "distance",       BR_COL_DIST },
+    { "armor",          BR_COL_ARMOR },
+    { "aim",            BR_COL_AIM },
+    { "health",         BR_COL_HEALTH },
+    { "crouch",         BR_COL_CROUCH },
+    { "skel",           BR_COL_SKEL },
+    { "skeleton",       BR_COL_SKEL },
+    { "cham",           BR_COL_CHAM },
+    { "chams",          BR_COL_CHAM },
+    { "box",            BR_COL_BOX },
+    { "radar_bg",       BR_COL_RADAR_BG },
+    { "radar_vehicle",  BR_COL_RADAR_VEHICLE },
+    { "radar_loot",     BR_COL_RADAR_LOOT },
+    { "radar_node",     BR_COL_RADAR_NODE },
+    { "loot_none",      BR_COL_LOOT_NONE },
+    { "loot_common",    BR_COL_LOOT_COMMON },
+    { "loot_uncommon",  BR_COL_LOOT_UNCOMMON },
+    { "loot_rare",      BR_COL_LOOT_RARE },
+    { "loot_epic",      BR_COL_LOOT_EPIC },
+    { "loot_legendary", BR_COL_LOOT_LEGENDARY },
+    { "loot_exotic",    BR_COL_LOOT_EXOTIC },
+    { "vehicle_marker", BR_COL_VEHICLE_MARKER },
+    { "vehicle_cham",   BR_COL_VEHICLE_CHAM },
+    { "self_status",    BR_COL_SELF_STATUS },
+    { "container",      BR_COL_CONTAINER },
+    { "door",           BR_COL_DOOR },
+    { "dropped_loot",   BR_COL_DROPPED_LOOT },
+    { "vehicle_loot",   BR_COL_VEHICLE_LOOT },
+    { "hide_object",    BR_COL_HIDE_OBJECT },
+    { "hide_objects",   BR_COL_HIDE_OBJECT },
+};
+
+/* Numeric keys stay the fast path used by the embedded page; names are a
+ * convenience for external tooling. Unknown keys resolve to -1. */
+static int color_index_for_key(const char* key) {
+    if (!key || !*key) return -1;
+    if (*key >= '0' && *key <= '9') {
+        char* end = nullptr;
+        long index = strtol(key, &end, 10);
+        if (end && !*end && index >= 0 && index < BR_COLOR_COUNT) return (int)index;
+        return -1;
+    }
+    for (size_t i = 0; i < sizeof(g_color_keys) / sizeof(g_color_keys[0]); ++i)
+        if (!strcmp(key, g_color_keys[i].key)) return g_color_keys[i].id;
+    return -1;
+}
+
+/* col: writes either a palette slot or one of the two UI accents. Returns the
+ * three bytes to overwrite, or null when the key is unknown. */
+static unsigned char* color_target(BR_Config* b, const char* key) {
+    if (!key || !*key) return NULL;
+    if (!strcmp(key, "accent")) return b->accent.rgb;
+    if (!strcmp(key, "secondary")) return b->secondary.rgb;
+    int index = color_index_for_key(key);
+    if (index < 0 || index >= BR_COLOR_COUNT) return NULL;
+    return b->color[index].rgb;
+}
+
+
 static std::string build_state_json(BR_Config* b) {
     std::string s("{");
 #define BR_JSON(field, initial, minimum, maximum) jcat_int(s, #field, b->field, s.size() == 1);
@@ -95,6 +207,21 @@ static std::string build_state_json(BR_Config* b) {
                  (unsigned)b->color[i].rgb[0], (unsigned)b->color[i].rgb[1], (unsigned)b->color[i].rgb[2]);
         s += rgb;
     }
+    s += "},\"accent\":[";
+    {
+        char rgb[64];
+        snprintf(rgb, sizeof(rgb), "%u,%u,%u],\"secondary\":[%u,%u,%u],\"role_colors\":{",
+                 (unsigned)b->accent.rgb[0], (unsigned)b->accent.rgb[1], (unsigned)b->accent.rgb[2],
+                 (unsigned)b->secondary.rgb[0], (unsigned)b->secondary.rgb[1], (unsigned)b->secondary.rgb[2]);
+        s += rgb;
+    }
+    for (int i = 0; i < BR_ROLE_COLOR_COUNT; ++i) {
+        char rgb[64];
+        snprintf(rgb, sizeof(rgb), "%s\"%s\":[%u,%u,%u]", i ? "," : "", g_role_color_keys[i],
+                 (unsigned)b->role_color[i].rgb[0], (unsigned)b->role_color[i].rgb[1],
+                 (unsigned)b->role_color[i].rgb[2]);
+        s += rgb;
+    }
     s += "}}";
     return s;
 }
@@ -104,6 +231,9 @@ static std::string build_telem_json(BR_Config* b) {
     jcat_int(s,"pid",b->telem_game_pid,1);
     jcat_int(s,"targets",b->telem_targets);
     jcat_int(s,"los",b->telem_los_state);
+    /* Live World-tab counters; extras_refresh() publishes them on the worker. */
+    jcat_int(s,"cop_count",b->telem_cop_count);
+    jcat_int(s,"slot_total",b->telem_slot_total);
     s += "}";
     return s;
 }
@@ -141,13 +271,20 @@ static HRESULT STDMETHODCALLTYPE msg_cb(ICoreWebView2* sender,
             br_config_set(b, body.substr(0,c2).c_str(), atoi(body.substr(c2+1).c_str()));
     }
     else if (cmd == "col") {
-        int index, red, green, blue;
-        if (sscanf(body.c_str(), "%d:%d,%d,%d", &index, &red, &green, &blue) == 4 &&
-            index >= 0 && index < BR_COLOR_COUNT &&
-            (unsigned)red <= 255 && (unsigned)green <= 255 && (unsigned)blue <= 255) {
-            b->color[index].rgb[0] = (unsigned char)red;
-            b->color[index].rgb[1] = (unsigned char)green;
-            b->color[index].rgb[2] = (unsigned char)blue;
+        /* Primary form is col:<index>:r,g,b. Named keys, plus the two UI
+         * accents, are accepted as a fallback for external tooling; unknown
+         * keys are ignored. */
+        size_t cut = body.find(':');
+        if (cut != std::string::npos) {
+            unsigned char* target = color_target(b, body.substr(0, cut).c_str());
+            int red = -1, green = -1, blue = -1;
+            if (target &&
+                sscanf(body.c_str() + cut + 1, "%d,%d,%d", &red, &green, &blue) == 3 &&
+                (unsigned)red <= 255 && (unsigned)green <= 255 && (unsigned)blue <= 255) {
+                target[0] = (unsigned char)red;
+                target[1] = (unsigned char)green;
+                target[2] = (unsigned char)blue;
+            }
         }
     }
     else if (cmd == "act") {
@@ -160,6 +297,23 @@ static HRESULT STDMETHODCALLTYPE msg_cb(ICoreWebView2* sender,
             } else {
                 wv_send("toast:Could not load CoreRR.cfg");
             }
+        } else if (body == "reset_colors") {
+            /* Restore the editable palette only; reserved slots keep their
+             * historical values so old profiles stay aligned. */
+            for (int i = 0; i < BR_COLOR_COUNT; ++i) {
+                if (br_color_is_legacy(i)) continue;
+                b->color[i].rgb[0] = g_default_colors[i][0];
+                b->color[i].rgb[1] = g_default_colors[i][1];
+                b->color[i].rgb[2] = g_default_colors[i][2];
+            }
+            b->accent.rgb[0] = g_default_accent[0];
+            b->accent.rgb[1] = g_default_accent[1];
+            b->accent.rgb[2] = g_default_accent[2];
+            b->secondary.rgb[0] = g_default_secondary[0];
+            b->secondary.rgb[1] = g_default_secondary[1];
+            b->secondary.rgb[2] = g_default_secondary[2];
+            wv_send("state:" + build_state_json(b));
+            wv_send("toast:Colors reset to defaults");
         }
     }
     else if(cmd=="drag"){
@@ -392,17 +546,22 @@ BR_Config* br_get(void){
         BR_SETTINGS(BR_DEFAULT)
 #undef BR_DEFAULT
         g_br_inst.menu_open = 1;
-        static const unsigned char pal[BR_COLOR_COUNT][3] = {
-            { 86,168,255},{255, 86, 86},{120,255,140},{ 86,255,246},
-            {158,158,158},{255,255,255},{255,255,255},{255,255,255},
-            {255,255,255},{255,255,255},{255,255,255},{120,255,140},
-            {255,176, 66},{139, 92,246},{220,220,220},
-        };
-        for(int i=0;i<BR_COLOR_COUNT;i++){
-            g_br_inst.color[i].rgb[0]=pal[i][0];
-            g_br_inst.color[i].rgb[1]=pal[i][1];
-            g_br_inst.color[i].rgb[2]=pal[i][2];
+        for (int i = 0; i < BR_COLOR_COUNT; ++i) {
+            g_br_inst.color[i].rgb[0] = g_default_colors[i][0];
+            g_br_inst.color[i].rgb[1] = g_default_colors[i][1];
+            g_br_inst.color[i].rgb[2] = g_default_colors[i][2];
         }
+        for (int i = 0; i < BR_ROLE_COLOR_COUNT; ++i) {
+            g_br_inst.role_color[i].rgb[0] = g_role_colors[i][0];
+            g_br_inst.role_color[i].rgb[1] = g_role_colors[i][1];
+            g_br_inst.role_color[i].rgb[2] = g_role_colors[i][2];
+        }
+        g_br_inst.accent.rgb[0] = g_default_accent[0];
+        g_br_inst.accent.rgb[1] = g_default_accent[1];
+        g_br_inst.accent.rgb[2] = g_default_accent[2];
+        g_br_inst.secondary.rgb[0] = g_default_secondary[0];
+        g_br_inst.secondary.rgb[1] = g_default_secondary[1];
+        g_br_inst.secondary.rgb[2] = g_default_secondary[2];
     }
     return &g_br_inst;
 }

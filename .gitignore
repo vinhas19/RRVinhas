@@ -7,6 +7,7 @@
 
 # Runtime output
 1_run/*.log
+2_src_port/*.log
 1_run/robrun_runtime.txt
 1_run/robrun_chain.txt
 1_run/CoreRR.cfg

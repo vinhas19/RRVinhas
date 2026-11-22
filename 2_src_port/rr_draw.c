@@ -19,6 +19,7 @@
 #include "rr_cham_model.h"
 #include "rr_body_joints.h"
 #include "rr_vehicle_cham_model.h"
+#include "rr_extras.h"
 
 static RGBA slot_color(int i) {
     BR_Config* b = br_get();
@@ -36,12 +37,19 @@ static RGBA role_color(const char* role) {
     return 0;
 }
 
-static RGBA player_color(const RR_PLAYER* p) {
+/* Role, relationship and downed colours stay authoritative; the palette slot is
+ * only consulted for players that have none of them. */
+static RGBA role_or_slot(const RR_PLAYER* p, int slot) {
     if (p->relationships & RR_REL_CLAN) return RRGB(218, 153, 255);
     if (p->relationships & RR_REL_POLICE) return RRGB(86, 255, 246);
-    if (p->dead) return slot_color(5);
+    if (p->dead) return slot_color(BR_COL_DOWNED);
     RGBA color = role_color(p->role);
-    return color ? color : slot_color(0);
+    return color ? color : slot_color(slot);
+}
+
+/* Generic marker colour: the radar draws every player dot with this. */
+static RGBA player_color(const RR_PLAYER* p) {
+    return role_or_slot(p, BR_COL_MARKER);
 }
 
 static void corner_box(float x, float y, float w, float h, RGBA col, float stroke) {
@@ -306,6 +314,19 @@ static int world_marker_visible(const RR_PLAYER* p, const BR_Config* b) {
            (p->is_loot == 6 && b->show_vehicle_loot);
 }
 
+/* Radar loot dots keep one colour per kind. The 3D markers stay driven by loot
+ * rarity in draw_loot(); these slots never touch them. */
+static RGBA radar_loot_color(int kind) {
+    switch (kind) {
+    case 2: return slot_color(BR_COL_RADAR_NODE);
+    case 3: return slot_color(BR_COL_CONTAINER);
+    case 4: return slot_color(BR_COL_DOOR);
+    case 5: return slot_color(BR_COL_DROPPED_LOOT);
+    case 6: return slot_color(BR_COL_VEHICLE_LOOT);
+    default: return slot_color(BR_COL_RADAR_LOOT);
+    }
+}
+
 static void draw_radar(const RR_PLAYER* arr, int n, const RR_CAMERA* cam,
                        int vw, int vh, const BR_Config* b) {
     const RR_PLAYER* local = NULL;
@@ -334,8 +355,10 @@ static void draw_radar(const RR_PLAYER* arr, int n, const RR_CAMERA* cam,
     float left = cx - width * .5f, top = cy - height * .5f;
     float plot_x = width * .5f - 6.0f, plot_y = height * .5f - 6.0f;
     float range = (float)b->radar_range;
-    /* The transparent centre leaves the game's map and icons visible. */
-    r_rect(left, top, width, height, RARGB(180, 230, 224, 245), 1.0f);
+    /* The transparent centre leaves the game's map and icons visible; only the
+     * rgb comes from the palette, the 180 alpha stays fixed. */
+    r_rect(left, top, width, height,
+           (slot_color(BR_COL_RADAR_BG) & 0x00FFFFFFu) | (180u << 24), 1.0f);
 
     for (int i = 0; i < n; ++i) {
         const RR_PLAYER* p = &arr[i];
@@ -349,16 +372,11 @@ static void draw_radar(const RR_PLAYER* arr, int n, const RR_CAMERA* cam,
         if (!(fabsf(lateral)<=range && fabsf(forward)<=range)) continue;
         float x = cx + lateral*(plot_x/range), y = cy - forward*(plot_y/range);
         if (p->is_vehicle) {
-            r_fill_ellipse(x, y, 2.8f, 2.8f, RRGB(255, 214, 110));
+            r_fill_ellipse(x, y, 2.8f, 2.8f, slot_color(BR_COL_RADAR_VEHICLE));
             continue;
         }
         if (p->is_loot) {
-            RGBA color = p->is_loot == 1 ? RRGB(235, 235, 235) :
-                         p->is_loot == 2 ? RRGB(201, 155, 255) :
-                         p->is_loot == 3 ? RRGB(255, 190, 92) :
-                         p->is_loot == 4 ? RRGB(200, 200, 200) :
-                         p->is_loot == 5 ? RRGB(111, 232, 145) : RRGB(105, 178, 255);
-            r_fill_ellipse(x, y, 2.3f, 2.3f, color);
+            r_fill_ellipse(x, y, 2.3f, 2.3f, radar_loot_color(p->is_loot));
             continue;
         }
         RGBA color = player_color(p);
@@ -409,16 +427,16 @@ static void draw_vehicle_cham(const RR_PLAYER* p, const RR_CAMERA* cam, int vw, 
     }
     if (right < 0 || bottom < 0 || left > vw || top > vh || right - left < 2.0f || bottom - top < 2.0f) return;
     /* A single translucent amber identifies the vehicle independently of the
-     * role colors used for its occupants. */
-    RGBA color = RARGB(80, 255, 181, 65);
+     * role colors used for its occupants; the 80 alpha stays fixed. */
+    RGBA color = (slot_color(BR_COL_VEHICLE_CHAM) & 0x00FFFFFFu) | (80u << 24);
     r_fill_triangles(projected, mesh->vertices, mesh->triangles, mesh->faces, color);
 }
 
 static void draw_loot(const RR_PLAYER* p, const RR_CAMERA* cam, int vw, int vh) {
     static const char* const rarity_names[] = { "", "Common", "Uncommon", "Rare", "Epic", "Legendary", "Exotic" };
-    static const RGBA rarity_colors[] = {
-        RRGB(230, 230, 230), RRGB(230, 230, 230), RRGB(111, 232, 145), RRGB(105, 178, 255),
-        RRGB(211, 155, 255), RRGB(255, 190, 92), RRGB(255, 113, 149)
+    static const int rarity_slots[] = {
+        BR_COL_LOOT_NONE, BR_COL_LOOT_COMMON, BR_COL_LOOT_UNCOMMON, BR_COL_LOOT_RARE,
+        BR_COL_LOOT_EPIC, BR_COL_LOOT_LEGENDARY, BR_COL_LOOT_EXOTIC
     };
     float x, y;
     if (!game_w2s(cam, &p->pos, vw, vh, &x, &y)) return;
@@ -428,11 +446,52 @@ static void draw_loot(const RR_PLAYER* p, const RR_CAMERA* cam, int vw, int vh) 
     char label[RR_NAME_MAX + 48];
     snprintf(label, sizeof(label), "%s%s%s%s (%.0f m)", prefix, name,
              rarity ? " / " : "", rarity_names[rarity], p->dist);
-    RGBA color = rarity_colors[rarity];
+    RGBA color = slot_color(rarity_slots[rarity]);
     if (p->is_loot == 2) r_ellipse(x, y, 4.0f, 4.0f, color, 1.5f);
     else r_fill_ellipse(x, y, 4.0f, 4.0f, color);
     gpu_font(12.0f);
     r_text(x, y + 6.0f, label, color, RT_CENTER | RT_OUTLINE);
+}
+
+/* World items from the read-only extras snapshot (rr_extras.c). The snapshot
+ * is a copy published by the discovery worker, so this path never touches
+ * target memory. Colour per kind reuses the palette slots the radar already
+ * uses; hiding objects have their own slot. */
+static void draw_world_items(const RR_CAMERA* cam, int vw, int vh, const BR_Config* b) {
+    static EXTRA_WORLD_ITEM items[EXTRA_MAX_WORLD_ITEMS];
+    int n = extras_world_snapshot(items, EXTRA_MAX_WORLD_ITEMS);
+    if (n <= 0) return;
+    /* Menu distances are centimetres for players and metres for the radar;
+     * world_item_distance follows the radar and is metres. */
+    float limit = b->world_item_distance > 0 ? (float)b->world_item_distance : 0.0f;
+    const RR_V3 eye = cam->pos;
+    for (int i = 0; i < n; ++i) {
+        const EXTRA_WORLD_ITEM* it = &items[i];
+        int slot;
+        switch (it->kind) {
+            case 1: if (!b->show_containers) continue;   slot = BR_COL_CONTAINER; break;
+            case 2: if (!b->show_dropped_loot) continue; slot = BR_COL_DROPPED_LOOT; break;
+            case 3: if (!b->show_vehicle_loot) continue; slot = BR_COL_VEHICLE_LOOT; break;
+            case 4: if (!b->show_doors) continue;        slot = BR_COL_DOOR; break;
+            case 5: if (!b->show_hide_objects) continue; slot = BR_COL_HIDE_OBJECT; break;
+            default: continue;
+        }
+        if (limit > 0) {
+            float dx = it->x - eye.x, dy = it->y - eye.y, dz = it->z - eye.z;
+            if (!isfinite(dx) || dx * dx + dy * dy + dz * dz > limit * limit) continue;
+        }
+        RR_V3 point = { it->x, it->y, it->z };
+        float x, y;
+        if (!game_w2s(cam, &point, vw, vh, &x, &y)) continue;
+        RGBA color = slot_color(slot);
+        r_fill_ellipse(x, y, 3.0f, 3.0f, color);
+        if (b->show_world_names) {
+            char label[26];
+            snprintf(label, sizeof(label), "%.24s", it->name[0] ? it->name : "?");
+            gpu_font(11.0f);
+            r_text(x, y + 6.0f, label, color, RT_CENTER | RT_OUTLINE);
+        }
+    }
 }
 
 void draw_esp(const RR_PLAYER* arr, int n, const RR_CAMERA* cam, int vw, int vh) {
@@ -464,7 +523,7 @@ void draw_esp(const RR_PLAYER* arr, int n, const RR_CAMERA* cam, int vw, int vh)
             if (!rr_relationship_allowed(p->relationships, b->show_clan, b->show_police)) continue;
             float fx,fy,hx,hy;
             if (!game_w2s(cam,&p->pos,vw,vh,&fx,&fy) && !game_w2s(cam,&p->head,vw,vh,&hx,&hy)) continue;
-            if (mesh_highlight(p,cam,vw,vh,player_color(p))) {
+            if (mesh_highlight(p,cam,vw,vh,role_or_slot(p, BR_COL_CHAM))) {
                 ++b->telem_cham_n;
             }
         }
@@ -477,7 +536,7 @@ void draw_esp(const RR_PLAYER* arr, int n, const RR_CAMERA* cam, int vw, int vh)
         gpu_font(12.0f);
         r_text(12.0f, 12.0f, !self ? "SELF: unavailable" :
                self->hidden_in_object ? "SELF: hiding object detected" : "SELF: no hiding object detected",
-               RRGB(227, 215, 252), RT_LEFT | RT_OUTLINE);
+               slot_color(BR_COL_SELF_STATUS), RT_LEFT | RT_OUTLINE);
     }
     int drawn = 0;
     for (int i = 0; i < n; i++) {
@@ -490,6 +549,10 @@ void draw_esp(const RR_PLAYER* arr, int n, const RR_CAMERA* cam, int vw, int vh)
         if (b->max_distance > 0 && p->dist > (float)b->max_distance / 100.0f) continue;
 
         if (p->is_loot) {
+            /* Kinds 3..6 (container, door, dropped and vehicle loot) are drawn
+             * by the World tab when its master switch is on, with a name; the
+             * radar-style marker would land on top of that one. */
+            if (p->is_loot >= 3 && b->show_world_items) continue;
             int visible = (p->is_loot == 1 && b->show_loot) ||
                           (p->is_loot == 2 && b->show_loot_nodes) ||
                           world_marker_visible(p, b);
@@ -506,7 +569,7 @@ void draw_esp(const RR_PLAYER* arr, int n, const RR_CAMERA* cam, int vw, int vh)
                     if (b->show_vehicle_occupants && p->occupants_known)
                         snprintf(label, sizeof label, "%s [%d] (%.0f m)", name, p->occupants, p->dist);
                     else snprintf(label, sizeof label, "%s (%.0f m)", name, p->dist);
-                    RGBA color = RRGB(255, 214, 110);
+                    RGBA color = slot_color(BR_COL_VEHICLE_MARKER);
                     r_fill_ellipse(x, y, 4.0f, 4.0f, color);
                     gpu_font(12.0f); r_text(x, y + 6.0f, label, color, RT_CENTER | RT_OUTLINE);
                 }
@@ -545,11 +608,16 @@ void draw_esp(const RR_PLAYER* arr, int n, const RR_CAMERA* cam, int vw, int vh)
         float by = fminf(hy, fy);
         if (bx < -200 || bx > vw + 200 || by < -200 || by > vh + 200) continue;
 
-        RGBA col = player_color(p);
+        /* Box, skeleton and chams each read their own slot, but a known role,
+         * relationship or downed state still wins for all of them. */
+        RGBA col = role_or_slot(p, BR_COL_BOX);
+        RGBA skel = role_or_slot(p, BR_COL_SKEL);
         if (p->dead) {
             /* downed: dim, but still visible */
             int a = 255 * 60 / 100;
-            col = (col & 0x00FFFFFFu) | ((uint32_t)a << 24);
+            RGBA dim = ((uint32_t)a << 24);
+            col = (col & 0x00FFFFFFu) | dim;
+            skel = (skel & 0x00FFFFFFu) | dim;
         }
 
 
@@ -567,7 +635,7 @@ void draw_esp(const RR_PLAYER* arr, int n, const RR_CAMERA* cam, int vw, int vh)
         }
         if (b->show_skeleton && (!p->inveh || p->full_rig) && !p->hidden_in_object &&
             (b->skel_distance <= 0 || p->dist <= (float)b->skel_distance / 100.0f)) {
-            gpu_pen(col, line_w);
+            gpu_pen(skel, line_w);
             if (p->full_rig && p->nbones == RR_CHAM_BONES) {
                 draw_full_skeleton(p,cam,vw,vh);
             } else if (p->nbones > 1) {
@@ -583,7 +651,7 @@ void draw_esp(const RR_PLAYER* arr, int n, const RR_CAMERA* cam, int vw, int vh)
                     float r = fabsf(fy - hyy) * 0.075f;
                     if (r < 2.5f) r = 2.5f;
                     if (r > 11.0f) r = 11.0f;
-                    r_fill_ellipse(hxx, hyy - r * 0.5f, r, r, col);
+                    r_fill_ellipse(hxx, hyy - r * 0.5f, r, r, skel);
                 }
             } else {
                 /* no rig data yet: two-segment torso fallback */
@@ -621,7 +689,7 @@ void draw_esp(const RR_PLAYER* arr, int n, const RR_CAMERA* cam, int vw, int vh)
             else label[0] = 0;
             if (label[0]) {
                 gpu_font(12.0f);
-                r_text(fx, by - 15.0f, label, slot_color(6), RT_CENTER | RT_OUTLINE);
+                r_text(fx, by - 15.0f, label, slot_color(BR_COL_NAME), RT_CENTER | RT_OUTLINE);
             }
         }
         if (p->hidden_in_object) {
@@ -640,7 +708,7 @@ void draw_esp(const RR_PLAYER* arr, int n, const RR_CAMERA* cam, int vw, int vh)
             char buf[32];
             fmt_num(buf, sizeof(buf), (unsigned)(p->dist + 0.5f), " m");
             gpu_font(11.0f);
-            r_text(fx, label_y, buf, slot_color(8), RT_CENTER | RT_OUTLINE);
+            r_text(fx, label_y, buf, slot_color(BR_COL_DIST), RT_CENTER | RT_OUTLINE);
             label_y += 12.0f;
         }
         if (b->show_weapon && p->weapon[0]) {
@@ -653,31 +721,36 @@ void draw_esp(const RR_PLAYER* arr, int n, const RR_CAMERA* cam, int vw, int vh)
             }
             wbuf[k] = 0;
             gpu_font(10.0f);
-            r_text(fx, label_y, wbuf, slot_color(7), RT_CENTER | RT_OUTLINE);
+            r_text(fx, label_y, wbuf, slot_color(BR_COL_WEAPON), RT_CENTER | RT_OUTLINE);
             label_y += 11.0f;
         }
         if (b->show_health && p->health >= 0) {
             char health[32];
             snprintf(health, sizeof health, "HP: %d", p->health);
             gpu_font(10.0f);
-            r_text(fx, label_y, health, slot_color(6), RT_CENTER | RT_OUTLINE);
+            r_text(fx, label_y, health, slot_color(BR_COL_HEALTH), RT_CENTER | RT_OUTLINE);
             label_y += 11.0f;
         }
         if (b->show_crouch && p->crouch == 1) {
             gpu_font(10.0f);
-            r_text(fx, label_y, "CROUCHING", slot_color(6), RT_CENTER | RT_OUTLINE);
+            r_text(fx, label_y, "CROUCHING", slot_color(BR_COL_CROUCH), RT_CENTER | RT_OUTLINE);
             label_y += 11.0f;
         }
         if (b->show_armor && p->armor == 1) {
             gpu_font(9.0f);
-            r_text(fx + bw * 0.5f + 3.0f, by + 2.0f, "ARMOR", slot_color(9), RT_LEFT | RT_OUTLINE);
+            r_text(fx + bw * 0.5f + 3.0f, by + 2.0f, "ARMOR", slot_color(BR_COL_ARMOR), RT_LEFT | RT_OUTLINE);
         }
         if (p->dead) {
             gpu_font(10.0f);
-            r_text(fx, by + bh * 0.5f, "DOWN", slot_color(5), RT_CENTER | RT_OUTLINE);
+            r_text(fx, by + bh * 0.5f, "DOWN", slot_color(BR_COL_DOWNED), RT_CENTER | RT_OUTLINE);
         }
         drawn++;
     }
+
+    /* World item markers come from the read-only extras snapshot. They are
+     * additive: nothing here changes the player path above. */
+    if (cam && cam->valid && (b->show_world_items || b->show_hide_objects))
+        draw_world_items(cam, vw, vh, b);
 
     /* Aim-assist FOV circle: same circle that defines the capture zone. */
     if (b->aa_on && b->aa_show_fov) {
@@ -685,7 +758,7 @@ void draw_esp(const RR_PLAYER* arr, int n, const RR_CAMERA* cam, int vw, int vh)
         if (r < 10) r = 10;
         if (r > 1200) r = 1200;
         r_ellipse((float)vw * 0.5f, (float)vh * 0.5f, (float)r, (float)r,
-                  slot_color(14), 1.0f);
+                  slot_color(BR_COL_AIM), 1.0f);
     }
     if (b->radar_on && n > 0) draw_radar(arr, n, cam, vw, vh, b);
 

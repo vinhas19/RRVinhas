@@ -35,6 +35,7 @@ static volatile LONG g_rescan_now = 0;
 #include "rr_chain.h"
 #include "rr_game.h"
 #include "rr_draw.h"
+#include "rr_extras.h"
 #include "rr_aim.h"
 #include "rr_los.h"
 #include "rr_find.h"
@@ -324,6 +325,10 @@ static int cfg_save_at(const wchar_t* path, const BR_Config* b) {
     for (int i = 0; i < BR_COLOR_COUNT; ++i)
         fprintf(f, "color%d=%u,%u,%u,0\n", i, (unsigned)b->color[i].rgb[0],
                 (unsigned)b->color[i].rgb[1], (unsigned)b->color[i].rgb[2]);
+    fprintf(f, "accent=%u,%u,%u,0\n", (unsigned)b->accent.rgb[0],
+            (unsigned)b->accent.rgb[1], (unsigned)b->accent.rgb[2]);
+    fprintf(f, "secondary=%u,%u,%u,0\n", (unsigned)b->secondary.rgb[0],
+            (unsigned)b->secondary.rgb[1], (unsigned)b->secondary.rgb[2]);
     int ok = !ferror(f);
     if (fclose(f) != 0) ok = 0;
     if (ok && MoveFileExW(temp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return 1;
@@ -358,6 +363,17 @@ static int cfg_load_at(const wchar_t* path, BR_Config* b) {
             }
             continue;
         }
+        if (!strcmp(line, "accent") || !strcmp(line, "secondary")) {
+            unsigned char* rgb = line[0] == 'a' ? loaded.accent.rgb : loaded.secondary.rgb;
+            int red, green, blue;
+            if (sscanf(value, "%d,%d,%d", &red, &green, &blue) == 3 &&
+                (unsigned)red <= 255 && (unsigned)green <= 255 && (unsigned)blue <= 255) {
+                rgb[0] = (unsigned char)red;
+                rgb[1] = (unsigned char)green;
+                rgb[2] = (unsigned char)blue;
+            }
+            continue;
+        }
         char* end;
         long number = strtol(value, &end, 10);
         if (end == value || *end) continue;
@@ -379,6 +395,8 @@ static int cfg_load_at(const wchar_t* path, BR_Config* b) {
         BR_SETTINGS(BR_APPLY)
 #undef BR_APPLY
         memcpy(b->color, loaded.color, sizeof(b->color));
+        b->accent = loaded.accent;
+        b->secondary = loaded.secondary;
     }
     return ok;
 }
@@ -999,6 +1017,11 @@ static int run_selftest(void) {
     written.radar_world = 1;
     written.show_health = written.show_crouch = written.show_vehicle_markers = written.show_vehicle_occupants = 1;
     written.show_containers = written.show_doors = written.show_dropped_loot = written.show_vehicle_loot = 1;
+    /* World tab: new rows must survive a save/load cycle like the older ones. */
+    written.show_world_items = written.show_cop_counter = written.show_hide_objects = 1;
+    written.show_world_names = 0;
+    written.world_item_distance = 1234;
+    written.instant_loot = 1;
     written.aa_los_on = 1;
     written.aa_closest_first = 1;
     written.show_loot = written.show_loot_nodes = written.vehicle_chams = 1;
@@ -1006,16 +1029,26 @@ static int run_selftest(void) {
     written.loot_tier_none = written.loot_tier_uncommon = written.loot_tier_epic = written.loot_tier_exotic = 1;
     written.aa_key = VK_RBUTTON;
     written.aa_bone = RR_AIM_FEET;
-    written.color[7].rgb[0] = 117;
+    written.color[BR_COL_WEAPON].rgb[0] = 117;
     check(have_temp && cfg_save_at(config_path, &written) && cfg_load_at(config_path, &loaded) &&
           loaded.radar_range == 275 && loaded.radar_on == 1 && loaded.radar_world == 1 &&
           loaded.show_containers == 1 && loaded.show_doors == 1 && loaded.show_dropped_loot == 1 && loaded.show_vehicle_loot == 1 &&
           loaded.show_health == 1 && loaded.show_crouch == 1 && loaded.show_vehicle_markers == 1 && loaded.show_vehicle_occupants == 1 && loaded.aa_los_on == 1 &&
-          loaded.aa_closest_first == 1 && loaded.aa_key == VK_RBUTTON && loaded.aa_bone == RR_AIM_FEET && loaded.color[7].rgb[0] == 117,
+          loaded.aa_closest_first == 1 && loaded.aa_key == VK_RBUTTON && loaded.aa_bone == RR_AIM_FEET && loaded.color[BR_COL_WEAPON].rgb[0] == 117,
           "config round trip saves radar, aim and colors");
     check(loaded.show_loot && loaded.show_loot_nodes && loaded.vehicle_chams,
           "config round trip saves loot and vehicle chams switches");
     check(loaded.show_self == 1, "config round trip saves self ESP switch");
+    check(loaded.show_world_items == 1 && loaded.show_cop_counter == 1 &&
+          loaded.show_hide_objects == 1 && loaded.show_world_names == 0 &&
+          loaded.world_item_distance == 1234,
+          "config round trip saves the World tab switches and item distance");
+    check(loaded.instant_loot == 1, "config round trip saves the instant loot switch");
+    check(BR_COL_HIDE_OBJECT == 38 && BR_COLOR_COUNT == 39 &&
+          br_get()->color[BR_COL_HIDE_OBJECT].rgb[0] == 180 &&
+          br_get()->color[BR_COL_HIDE_OBJECT].rgb[1] == 92 &&
+          br_get()->color[BR_COL_HIDE_OBJECT].rgb[2] == 255,
+          "hiding object colour slot is appended with its default");
     check(br_loot_rarity_visible(&loaded, 0) && !br_loot_rarity_visible(&loaded, 1) &&
           br_loot_rarity_visible(&loaded, 2) && !br_loot_rarity_visible(&loaded, 3) &&
           br_loot_rarity_visible(&loaded, 4) && !br_loot_rarity_visible(&loaded, 5) &&
@@ -1058,6 +1091,50 @@ static int run_selftest(void) {
     check(RR_OFF_WEM_BATTLE_CHARS == 0x18, "WorldEntitiesModel._battleCharacters from dump (0x18)");
     check(RR_OFF_WORLD_ENTITIES == 0x38, "WorldModel.WorldEntitiesModel from dump (0x38)");
     check(RR_OFF_CAM_POS == 0x10 && RR_OFF_CAM_ROT == 0x1C, "BattleCameraModel Position/Orientation");
+
+    /* 2b. read-only extras: constants and a publication cycle that never
+     * reaches the target (no battle, no world, no driver). */
+    check(EX_OFF_BATTLE_SLOTS_MODEL == 0x4D0u && EX_OFF_SLOTS_ARRAY == 0x10u &&
+          EX_OFF_DICT_ENTRIES == 0x18u && EX_OFF_DICT_USED == 0x20u &&
+          EX_OFF_DICT_STRIDE == 0x18u && EX_OFF_WE_HIDE_OBJECTS == 0x1B0u &&
+          EX_OFF_HIDE_DESC_POS == 0x30u,
+          "extras offsets match the 17/11/2026 table");
+    {
+        static EXTRA_WORLD_ITEM extra_items[8];
+        extras_reset();
+        extras_refresh(0, 0, 1);
+        check(extras_cop_count() == 0 && extras_slot_total() == 0 &&
+              extras_world_snapshot(extra_items, 8) == 0,
+              "extras publish nothing when the battle and world are unknown");
+    }
+
+    /* 2c. instant loot: the offsets, and the paths that must not write. The
+     * self-test has no driver attached, so a write attempt could only fail
+     * here; these checks pin the switch and the guard order instead. */
+    check(EX_OFF_UPDATER_TO_SCREEN == 0x68u && EX_OFF_SCREEN_TO_INST == 0x540u &&
+          EX_OFF_INST_TIME_CELL == 0x58u && EX_OFF_INST_LIST == 0x18u &&
+          EX_OFF_LIST_ITEMS == 0x10u && EX_OFF_LIST_COUNT == 0x18u &&
+          EX_OFF_LIST_STRIDE == 0x18u && EX_OFF_PAIR_DESC == 0x10u &&
+          EX_OFF_DESC_SHINE == 0x40u && EX_OFF_DESC_ICON_REVEAL == 0x68u &&
+          EX_OFF_DESC_GLOW_COLOR == 0x58u &&
+          EX_INST_TIME_CELL_MAX == 5.0f && EX_INST_DURATION_MAX == 10.0f &&
+          EX_INST_MAX_ITEMS == 500 && EX_INST_TICK_MS == 250,
+          "instant loot offsets match the 19/11/2026 table");
+    {
+        BR_Config* live = br_get();
+        int saved = live->instant_loot;
+        live->instant_loot = 0;
+        check(extras_insta_tick(0, 0) == 0 && extras_insta_tick(0x1000, 0x2000) == 0 &&
+              extras_insta_tick(0x100000, 0x200000) == 0,
+              "instant loot writes nothing while the switch is off");
+        live->instant_loot = 1;
+        check(extras_insta_tick(0, 0) == 0 && extras_insta_tick(0x1000, 0x2000) == 0 &&
+              extras_insta_tick(0x1000, 0) == 0,
+              "instant loot writes nothing without a validated updater");
+        check(extras_insta_tick(0x100000, 0x200000) == 0,
+              "instant loot rejects a pointer that is not a BattleEntitiesUpdater");
+        live->instant_loot = saved;
+    }
 
     /* 3. projection math: camera at origin looking +Z, 90 deg vertical FOV */
     RR_CAMERA cam;

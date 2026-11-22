@@ -46,6 +46,7 @@ echo [5/9] rr_chain.c
 cl %CFLAGS% /c rr_chain.c /Fo:rr_chain.obj || goto fail
 echo [6/9] rr_draw.c
 cl %CFLAGS% /c rr_draw.c /Fo:rr_draw.obj || goto fail
+cl %CFLAGS% /c rr_extras.c /Fo:rr_extras.obj || goto fail
 cl %CFLAGS% /c rr_aim.c /Fo:rr_aim.obj || goto fail
 cl %CFLAGS% /c rr_los_geom.c /Fo:rr_los_geom.obj || goto fail
 cl %CFLAGS% /c rr_los_capture.c /Fo:rr_los_capture.obj || goto fail
@@ -62,7 +63,7 @@ cl %CFLAGS% /c rr_find.c /Fo:rr_find.obj || goto fail
 echo [9/9] resources + link
 rc /nologo /fo app.res app.rc || goto fail
 link /nologo /SUBSYSTEM:WINDOWS /MACHINE:X64 /OUT:RobRunPort.exe ^
-  rr_esp.obj rr_game.obj rr_mem.obj rr_unity.obj rr_chain.obj rr_draw.obj rr_aim.obj ^
+  rr_esp.obj rr_game.obj rr_mem.obj rr_unity.obj rr_chain.obj rr_draw.obj rr_extras.obj rr_aim.obj ^
   rr_los_geom.obj rr_los_capture.obj rr_los_runtime.obj rr_los.obj rr_spawn.obj ^
  rr_nodescan.obj rr_classscan.obj rr_find.obj ^
   gpu.obj menu_webview.obj app.res ^

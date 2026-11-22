@@ -46,6 +46,7 @@ static void dlog(const char* fmt, ...) {
 #include "rr_cham_coherence.h"
 #include "rr_world_marker_select.h"
 #include "rr_hiding.h"
+#include "rr_extras.h"
 
 /* These fields are read as packed XYZ triples below. A new SDK layout must
  * fail compilation rather than silently keep using a twelve-byte read. */
@@ -2127,6 +2128,11 @@ static DWORD WINAPI scan_worker(LPVOID p) {
             cache_world_markers();
         }
 
+        /* Read-only extras: the cop counter and the named world item snapshot.
+         * extras_refresh() throttles itself (400 ms) and revalidates every
+         * pointer it follows, so a torn-down world publishes nothing. */
+        extras_refresh(g_battle, g_world, 0);
+
         /* Resolve the scene's slot table on the background worker, once per
          * world. Validate the world link whenever the cached object is used. */
         now = GetTickCount();
@@ -3189,6 +3195,7 @@ void game_reattach_reset(void) {
     g_vehicle_world = 0;
     g_vehicle_generation++;
     if (g_cs_ready) LeaveCriticalSection(&g_cache_cs);
+    extras_reset();
     g_world = 0;
     g_cam_obj = 0;
     g_k_world = 0;

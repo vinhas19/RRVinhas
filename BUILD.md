@@ -82,6 +82,29 @@ are interactive visual checks; see README for exercises. All modes use the
 same manifest and therefore request elevation. No game or driver is needed
 for these checks, and `--nohide` skips the startup visibility request.
 
+To validate the color palette round-trip, run as administrator: RobRunPort.exe --selftest --nohide --no-pause, then inspect selftest.log for the color[7] round-trip check (`config round trip saves radar, aim and colors`). The accent and secondary pickers round-trip through the same cfg.
+
+`rr_extras.c` is the "extras" module behind the World tab: the roster cop
+counter, the containers / loot / vehicle loot / doors / hiding-object snapshot,
+and instant loot. The two read features only read target memory (`rr_read`), run
+on the discovery worker through `extras_refresh()`, and publish under an SRW
+lock; the renderer and the menu copy that publication.
+
+Instant loot is the module's only writer. While the World tab switch is on, a
+250 ms loop (`extras_insta_tick()`) zeroes the cell-border, shine and icon
+reveal durations of the container being viewed, through the existing
+`rr_write()` path (`IOCTL_WRITE`, a bounded METHOD_BUFFERED packet the driver
+copies with `MmCopyVirtualMemory`; no driver change was needed). Every pass is
+gated: the switch is re-read first, the updater must class-check as
+`BattleEntitiesUpdater` and still point at the current battle, both content
+links must be non-null (a closed container stops the writes), the list size must
+be 1..500, and each timer must read finite and inside 0..5 s / 0..10 s before it
+is written. Anything out of range is skipped, so a stale offset writes nothing
+instead of corrupting the descriptor. `desc + 0x58` (GlowColor) is never
+written. The loop is stopped and joined by `extras_reset()` before teardown.
+The self-test checks the offsets, that the switch round trips, and that the off,
+null-pointer and bogus-pointer paths all return zero writes.
+
 `--probe`, write tests, memory searches and other diagnostics have different
 requirements and side effects. Read their dispatch branches and implementations
 in `rr_esp.c` before running them.
