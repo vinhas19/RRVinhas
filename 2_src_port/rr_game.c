@@ -519,6 +519,31 @@ static int class_named(uint64_t k, const char* want) {
     return !_stricmp(nm, want);
 }
 
+/* A class address published by an earlier attach is polled before the heap is
+ * searched. On a re-attach the metadata page is usually mapped at the same base
+ * and the class record becomes readable within a frame or two, while a full
+ * resolve_class() pass costs seconds. An address left over from another process
+ * never passes the name test, so the wait is bounded and the scan still runs. */
+#define CACHED_CLASS_POLL_MS 100
+#define CACHED_CLASS_WAIT_MS 1000
+
+static uint64_t cached_class_wait(uint64_t cached, const char* name) {
+    if (!PL(cached)) return 0;
+    DWORD start = GetTickCount();
+    for (;;) {
+        if (class_named(cached, name)) {
+            dlog("cached_class 0x%llX accepted after %lu ms",
+                 (unsigned long long)cached, (unsigned long)(GetTickCount() - start));
+            return cached;
+        }
+        if ((DWORD)(GetTickCount() - start) >= CACHED_CLASS_WAIT_MS) break;
+        Sleep(CACHED_CLASS_POLL_MS);
+    }
+    dlog("cached_class 0x%llX stale after %lu ms",
+         (unsigned long long)cached, (unsigned long)(GetTickCount() - start));
+    return 0;
+}
+
 static int camera_validate(uint64_t c) {
     if (!PL(c) || !class_named(u_klass(c), "BattleCameraModel")) return 0;
     RR_V3 fwd, pos;
@@ -2130,8 +2155,20 @@ static DWORD WINAPI scan_worker(LPVOID p) {
 
         /* Read-only extras: the cop counter and the named world item snapshot.
          * extras_refresh() throttles itself (400 ms) and revalidates every
-         * pointer it follows, so a torn-down world publishes nothing. */
-        extras_refresh(g_battle, g_world, 0);
+         * pointer it follows, so a torn-down world publishes nothing.
+         * The battle argument must be the BattleModel: the slot table hangs off
+         * its +0x4D0 (BattleCharacterSlotsModel) and ex_roles() walks back to
+         * BattleEntitiesModel at +0x90. g_battle is already the entities model
+         * (BattleModel + 0x90), so passing it made ex_slots() fail its class
+         * check and the counter read 0/0 in a full lobby. A model that no longer
+         * points at the current battle is dropped: the heap battle scan can
+         * replace g_battle without the chain, and the previous scene's seat
+         * table must not be published. */
+        uint64_t cop_battle = g_battle_model;
+        if (PL(cop_battle) && PL(g_battle) &&
+            rr_u64(cop_battle + RR_OFF_BATTLE_ENTITIES) != g_battle)
+            cop_battle = 0;
+        extras_refresh(cop_battle, g_world, 0);
 
         /* Resolve the scene's slot table on the background worker, once per
          * world. Validate the world link whenever the cached object is used. */
@@ -3825,8 +3862,27 @@ static int probe_class(uint64_t klass) {
     int name_ok = _stricmp(nm, "BattleCharacterModel") == 0;
     int f1 = class_has_field(klass, "Transform");
     int f2 = class_has_field(klass, "SkeletonModel");
-    if (!(name_ok && (f1 || f2))) {
-        uint64_t fp = rr_u64(klass + 0x80);
+    uint64_t fp = rr_u64(klass + 0x80);
+    int count = (int)(rr_u32(klass + 0x120) & 0xFFFFu);
+    if (name_ok && (f1 || f2)) {
+        dlog("probe_class accept 0x%llX fields=0x%llX count=%d T=%d S=%d",
+             (unsigned long long)klass, (unsigned long long)fp, count, f1, f2);
+        return 1;
+    }
+    /* The name matches but the field table is not materialised yet: il2cpp
+     * fills Il2CppClass.fields when the class initializer runs, which lags the
+     * metadata registration that already provides the name and the field count.
+     * A plausible count separates the real class (106) from the name-string
+     * lookalikes seen on the same target (0, or a pointer-shaped 2672), and
+     * nothing outside this probe reads the table -- class_named(), roster
+     * matching and the worker's revalidation all use the class name -- so
+     * accepting here is safe and turns the six-pass retry into one pass. */
+    if (name_ok && !PL(fp) && count >= 1 && count <= 512) {
+        dlog("probe_class accept 0x%llX fields pending fields=0x%llX count=%d T=%d S=%d",
+             (unsigned long long)klass, (unsigned long long)fp, count, f1, f2);
+        return 1;
+    }
+    {
         char n0[48] = {0}, n1[48] = {0}, n2[48] = {0}, n3[48] = {0};
         if (PL(fp)) {
             rr_cstr(rr_u64(fp + 0x00), n0, sizeof(n0));
@@ -3835,11 +3891,10 @@ static int probe_class(uint64_t klass) {
             rr_cstr(rr_u64(fp + 0x60), n3, sizeof(n3));
         }
         dlog("probe_class reject 0x%llX name='%s' fields=0x%llX count=%d T=%d S=%d ['%s' '%s' '%s' '%s']",
-             (unsigned long long)klass, nm, (unsigned long long)fp,
-             (int)(rr_u32(klass + 0x120) & 0xFFFFu), f1, f2, n0, n1, n2, n3);
+             (unsigned long long)klass, nm, (unsigned long long)fp, count, f1, f2,
+             n0, n1, n2, n3);
         return 0;
     }
-    return 1;
 }
 
 /* Camera classes cannot be validated with the character probe: their fields are
@@ -4899,6 +4954,9 @@ int game_init(void) {
     }
     runtime_load();
     chain_load("robrun_chain.txt");
+    /* The address the previous attach published, kept aside before the fast
+     * entry path can replace g_k_char with the live roster's class. */
+    uint64_t cached_char = g_k_char;
 
     if (!g_cs_ready) { InitializeCriticalSection(&g_cache_cs); g_cs_ready = 1; }
     xf_pool_init();
@@ -4953,6 +5011,11 @@ int game_init(void) {
     }
     if (!g_k_char || !class_named(g_k_char, "BattleCharacterModel"))
         g_k_char = 0;
+    /* Re-attach: poll the cached address for a moment before paying for a heap
+     * scan. Only an address that never reads back as the class falls through to
+     * the full resolve, so a stale cache costs one second at worst. */
+    if (!g_k_char && cached_char)
+        g_k_char = cached_class_wait(cached_char, "BattleCharacterModel");
     if (!g_k_char) g_k_char = resolve_class("BattleCharacterModel");
     if (!g_k_char) { set_status("BattleCharacterModel class not found [%s]", g_dbg); return 0; }
     dlog("char=0x%llX after %lu ms", (unsigned long long)g_k_char, (unsigned long)(GetTickCount() - t0));

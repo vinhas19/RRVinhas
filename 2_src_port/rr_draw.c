@@ -494,6 +494,53 @@ static void draw_world_items(const RR_CAMERA* cam, int vw, int vh, const BR_Conf
     }
 }
 
+/* ---- cop counter HUD ---------------------------------------------------- */
+
+/* Police blue #3B82F6. Deliberately not a palette slot: the menu has no control
+ * for this line, so there is nothing to round-trip through CoreRR.cfg. */
+#define COP_HUD_COLOR RRGB(0x3B, 0x82, 0xF6)
+/* Top-right corner, 16 px in from the surface edge, right-aligned. The game
+ * draws its own status line in that corner ("EARLY ACCESS. DOES NOT REFLECT THE
+ * FINAL QUALITY ..." at 1080p), so the counter sits below it instead of on top
+ * of it: 40 px clears that line with a gap at 1080p and still reads at a glance
+ * in the corner. */
+#define COP_HUD_MARGIN 16.0f
+#define COP_HUD_Y      40.0f
+
+/* The numbers are the publication the menu already reads; this module never
+ * touches game memory. Everything the string needs is decided here so the
+ * self-test can pin the exact bytes and every "draw nothing" path. */
+int cop_hud_text(char* out, int cap, const BR_Config* b) {
+    if (!out || cap < 32 || !b) return 0;
+    out[0] = 0;
+    if (!b->show_cop_counter) return 0;
+    /* An empty slot table means no battle: the last one's numbers are stale. */
+    int occupied = b->telem_slot_total;
+    if (occupied <= 0) return 0;
+    int cops = b->telem_cop_count;
+    if (cops < 0) cops = 0;
+    int seats = b->telem_slot_seats;
+    if (seats < occupied) {
+        /* The table size did not come back with the occupancy count: report the
+         * cops and claim no free seat instead of inventing one. */
+        snprintf(out, (size_t)cap, "\xF0\x9F\x91\xAE %d cop%s",
+                 cops, cops == 1 ? "" : "s");
+        return 1;
+    }
+    int vagas = seats - occupied;
+    snprintf(out, (size_t)cap, "\xF0\x9F\x91\xAE %d cop%s \xC2\xB7 %d vaga%s",
+             cops, cops == 1 ? "" : "s", vagas, vagas == 1 ? "" : "s");
+    return 1;
+}
+
+static void draw_cop_hud(int vw) {
+    char line[64];
+    if (!cop_hud_text(line, (int)sizeof(line), br_get())) return;
+    gpu_font(12.0f);
+    r_text((float)vw - COP_HUD_MARGIN, COP_HUD_Y, line, COP_HUD_COLOR,
+           RT_RIGHT | RT_OUTLINE);
+}
+
 void draw_esp(const RR_PLAYER* arr, int n, const RR_CAMERA* cam, int vw, int vh) {
     BR_Config* b = br_get();
     b->telem_cham_n=0;
@@ -538,6 +585,9 @@ void draw_esp(const RR_PLAYER* arr, int n, const RR_CAMERA* cam, int vw, int vh)
                self->hidden_in_object ? "SELF: hiding object detected" : "SELF: no hiding object detected",
                slot_color(BR_COL_SELF_STATUS), RT_LEFT | RT_OUTLINE);
     }
+    /* Cop counter in the top-right corner, under the game's own status line.
+     * Drawn from the published telemetry only, so it costs this frame no reads. */
+    draw_cop_hud(vw);
     int drawn = 0;
     for (int i = 0; i < n; i++) {
         /* Apply the player drawing budget while walking the mixed snapshot. */

@@ -1022,6 +1022,7 @@ static int run_selftest(void) {
     written.show_world_names = 0;
     written.world_item_distance = 1234;
     written.instant_loot = 1;
+    written.debug_slots = 1;
     written.aa_los_on = 1;
     written.aa_closest_first = 1;
     written.show_loot = written.show_loot_nodes = written.vehicle_chams = 1;
@@ -1044,6 +1045,9 @@ static int run_selftest(void) {
           loaded.world_item_distance == 1234,
           "config round trip saves the World tab switches and item distance");
     check(loaded.instant_loot == 1, "config round trip saves the instant loot switch");
+    check(loaded.debug_slots == 1 && br_config_set(&loaded, "debug_slots", 7) &&
+          loaded.debug_slots == 1,
+          "config round trip saves the slots debug switch, clamped to 0..1");
     check(BR_COL_HIDE_OBJECT == 38 && BR_COLOR_COUNT == 39 &&
           br_get()->color[BR_COL_HIDE_OBJECT].rgb[0] == 180 &&
           br_get()->color[BR_COL_HIDE_OBJECT].rgb[1] == 92 &&
@@ -1106,6 +1110,90 @@ static int run_selftest(void) {
         check(extras_cop_count() == 0 && extras_slot_total() == 0 &&
               extras_world_snapshot(extra_items, 8) == 0,
               "extras publish nothing when the battle and world are unknown");
+    }
+
+    /* 2b1. slots debug: the diagnostic must reach status.log with no battle at
+     * all -- that is exactly the case where the counter reads zero and nothing
+     * else separates "chain broken" from "empty lobby". Only the switch and the
+     * writer are exercised here; the chain itself needs a live target. */
+    {
+        BR_Config* live = br_get();
+        int saved = live->debug_slots;
+        live->debug_slots = 1;
+        extras_reset();
+        extras_refresh(0, 0, 1);
+        int found = 0;
+        char dpath[MAX_PATH];
+        DWORD dlen = GetModuleFileNameA(NULL, dpath, MAX_PATH);
+        char* dslash = dlen ? strrchr(dpath, '\\') : NULL;
+        if (dslash) {
+            *(dslash + 1) = 0;
+            strncat(dpath, "status.log", MAX_PATH - strlen(dpath) - 1);
+            FILE* df = fopen(dpath, "r");
+            if (df) {
+                char tail[4096];
+                tail[0] = 0;
+                if (fseek(df, 0, SEEK_END) == 0) {
+                    long size = ftell(df);
+                    long start = size > (long)sizeof(tail) - 1 ? size - (long)sizeof(tail) + 1 : 0;
+                    if (size > 0 && fseek(df, start, SEEK_SET) == 0) {
+                        size_t got = fread(tail, 1, sizeof(tail) - 1, df);
+                        tail[got] = 0;
+                        found = strstr(tail, "slots_debug: battle=0x0 model=0x0 is_slots=0") != NULL;
+                    }
+                }
+                fclose(df);
+            }
+        }
+        live->debug_slots = saved;
+        check(found, "slots debug writes a status.log line with no battle");
+    }
+
+    /* 2b2. cop HUD: the exact bytes the overlay draws, and the three gates
+     * that must draw nothing. A copy of the live config is used, so the
+     * checks never disturb the settings the overlay is running with. */
+    {
+        BR_Config probe = *br_get();
+        char line[64];
+        probe.show_cop_counter = 1;
+        probe.telem_cop_count = 12;
+        probe.telem_slot_total = 15;
+        probe.telem_slot_seats = 18;
+        check(cop_hud_text(line, (int)sizeof(line), &probe) &&
+              strcmp(line, "\xF0\x9F\x91\xAE 12 cops \xC2\xB7 3 vagas") == 0,
+              "cop HUD reads \"12 cops . 3 vagas\" for 12 cops in 15/18 seats");
+        probe.telem_cop_count = 1;
+        probe.telem_slot_total = 3;
+        probe.telem_slot_seats = 4;
+        check(cop_hud_text(line, (int)sizeof(line), &probe) &&
+              strcmp(line, "\xF0\x9F\x91\xAE 1 cop \xC2\xB7 1 vaga") == 0,
+              "cop HUD uses the singular forms for one cop and one free seat");
+        probe.telem_cop_count = 12;
+        probe.telem_slot_total = 12;
+        probe.telem_slot_seats = 12;
+        check(cop_hud_text(line, (int)sizeof(line), &probe) &&
+              strcmp(line, "\xF0\x9F\x91\xAE 12 cops \xC2\xB7 0 vagas") == 0,
+              "cop HUD shows 0 vagas when every seat is occupied");
+        probe.show_cop_counter = 0;
+        check(!cop_hud_text(line, (int)sizeof(line), &probe),
+              "cop HUD draws nothing with show_cop_counter off");
+        probe.show_cop_counter = 1;
+        probe.telem_cop_count = 0;
+        probe.telem_slot_total = 0;
+        probe.telem_slot_seats = 0;
+        check(!cop_hud_text(line, (int)sizeof(line), &probe),
+              "cop HUD draws nothing without a battle (slot_total 0)");
+        probe.telem_cop_count = 12;
+        probe.telem_slot_total = 12;
+        check(cop_hud_text(line, (int)sizeof(line), &probe) &&
+              strcmp(line, "\xF0\x9F\x91\xAE 12 cops") == 0,
+              "cop HUD omits vagas when the seat table size is missing");
+        probe.telem_cop_count = 13;
+        probe.telem_slot_total = 12;
+        probe.telem_slot_seats = 12;
+        check(cop_hud_text(line, (int)sizeof(line), &probe) &&
+              strcmp(line, "\xF0\x9F\x91\xAE 13 cops \xC2\xB7 0 vagas") == 0,
+              "cop HUD clamps vagas at 0 when cops outnumber the seats");
     }
 
     /* 2c. instant loot: the offsets, and the paths that must not write. The
@@ -2817,6 +2905,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     if (mode_demo) {
         snprintf(g_status, sizeof(g_status), "DEMO - synthetic players");
         g_show_footer = 1;
+        /* Synthetic telemetry for the cop HUD. The demo has no worker and no
+         * game, and the HUD only reads these published fields, so it is
+         * exercised through the same path the live overlay uses. Values match
+         * the design sample: 12 cops, 15 occupied seats, 18 seats in the table. */
+        BR_Config* demo_cfg = br_get();
+        demo_cfg->telem_cop_count = 12;
+        demo_cfg->telem_slot_total = 15;
+        demo_cfg->telem_slot_seats = 18;
     }
     /* Standalone UI opens immediately; the overlay opens its menu with F1. */
     br_set_menu_visible(mode_menu ? 1 : 0);

@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define BR_MAGIC 0x57444D31u
-#define BR_VERSION 16u
+#define BR_VERSION 18u
 
 /* Named colour slots shared by the menu and the renderer.
  * 0..14 keep their historical order so existing CoreRR.cfg files load
@@ -138,7 +138,8 @@ static int br_color_is_legacy(int id) {
     X(show_cop_counter, 0, 0, 1) \
     X(show_hide_objects, 0, 0, 1) \
     X(world_item_distance, 500, 50, 5000) \
-    X(instant_loot, 0, 0, 1)
+    X(instant_loot, 0, 0, 1) \
+    X(debug_slots, 0, 0, 1)   /* slot-chain diagnostic: slots_debug lines in status.log */
 
 typedef struct BR_Config {
     unsigned int magic, version;
@@ -158,6 +159,7 @@ typedef struct BR_Config {
     int telem_los_state; /* 0 off, 1 loading/stale, 2 ready */
     int telem_cop_count;  /* published by extras_refresh(), read by telem: */
     int telem_slot_total;
+    int telem_slot_seats; /* slot-table rows: occupied seats + free seats    */
 
 #ifdef RR_PORT_DIAGNOSTICS
     int show_vehicles;

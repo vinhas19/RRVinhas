@@ -90,6 +90,40 @@ and instant loot. The two read features only read target memory (`rr_read`), run
 on the discovery worker through `extras_refresh()`, and publish under an SRW
 lock; the renderer and the menu copy that publication.
 
+The cop counter publishes three integers: occupied seats, of which the cop
+count, plus the number of rows in `BattleCharacterSlotsModel._slots`. A seat
+without a player keeps its row (its `EntityId` references -1, the case
+`rr_hiding.h` skips), so the row count is the seat capacity the model exposes --
+there is no `_max`/`Capacity` field in the dump. The overlay's cop HUD therefore
+reports free seats as `rows - occupied`, clamped at 0, and nothing at all when
+the row count is missing. `cop_hud_text()` in `rr_draw.c` builds that line
+(police glyph, "N cop"/"N cops", middle dot, "N vaga"/"N vagas") from the
+`telem_cop_count` / `telem_slot_total` / `telem_slot_seats` fields the menu
+reads; `draw_cop_hud()` puts it in the top-right corner of the overlay surface
+on the SELF status baseline, 16 px in from the edge, at 12 px in the same font
+and outline, in the fixed police blue `#3B82F6`. With `show_cop_counter` off, or
+before a battle publishes a seat table, the function returns before drawing.
+`--demo` seeds that telemetry (12 cops, 15 occupied, 18 seats), so demo mode
+renders the HUD without a game.
+
+The slot chain fails closed: an offset that no longer matches reads as a count
+of zero, which looks exactly like a lobby with no seats. To tell the two apart,
+`debug_slots` (default 0, in `CoreRR.cfg`; it is not a World-tab switch) makes
+`extras_refresh()` append one `slots_debug:` line per second to `status.log`
+beside the overlay. Each line prints the link the reader follows -- `battle`,
+`model` (`battle + 0x4D0`), `is_slots`, `dict` (`model + 0x10`), `used`
+(`dict + 0x20`), then the first used row's `first_key`, `first_eid`,
+`first_is_slot` and `first_is_data` -- followed by the raw addresses behind them
+(`row`, `hash`, `key_q`, `slot`, `data`, `ref`, `desc`, `entries`, `cnt`,
+`stride`) and the class name each pointer actually points at. The first link
+that reads as 0, or whose class name does not match, is the broken one:
+`model_cls` says what `battle + 0x4D0` really points at, and `key_q` shows the
+full 8 bytes of the dictionary key, so a table keyed by an object reference is
+visible as a heap pointer instead of a small entity id. The line is written
+before the refresh's "nothing consumes this" early return, so the switch reports
+even with every feature off. Leave it off for normal use: at one line per second
+`status.log` grows without bound.
+
 Instant loot is the module's only writer. While the World tab switch is on, a
 250 ms loop (`extras_insta_tick()`) zeroes the cell-border, shine and icon
 reveal durations of the container being viewed, through the existing

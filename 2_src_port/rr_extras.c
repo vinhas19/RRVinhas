@@ -3,7 +3,9 @@
  * Two read features share one publication:
  *   - the roster's cop count, derived from BattleCharacterSlotsModel and the
  *     entity map, so it counts seats that hold a character (not the entity
- *     dictionary, which also carries non-player entities);
+ *     dictionary, which also carries non-player entities). The slot table's row
+ *     count travels with it as the seat capacity, which is what the free-seat
+ *     count in the overlay HUD is measured against;
  *   - a snapshot of the five WorldEntitiesModel collections with a position and
  *     a description for each.
  *
@@ -58,6 +60,13 @@ void extras_reset(void) {
     g_slot_total = 0;
     g_have_stamp = 0;
     ReleaseSRWLockExclusive(&g_lock);
+    /* The telemetry copy is what the menu and the on-screen cop HUD read, so a
+     * teardown clears it as well: after the game is gone the overlay must not
+     * keep drawing the last battle's counter. */
+    BR_Config* cfg = br_get();
+    cfg->telem_cop_count = 0;
+    cfg->telem_slot_total = 0;
+    cfg->telem_slot_seats = 0;
 }
 
 int extras_cop_count(void) {
@@ -213,14 +222,127 @@ static uint64_t ex_row_value(const uint8_t* row) {
 
 /* ---- Feature 1: cop counter -------------------------------------------- */
 
+/* ---- diagnostic: the slot chain, one status.log line per second ----------
+ *
+ * The cop counter fails closed: a stale offset publishes a count of zero, which
+ * is indistinguishable from a lobby with no seats. With debug_slots on, every
+ * refresh appends the raw contents of each link to status.log, so the first link
+ * that reads as zero (or as a class that does not match) names the culprit.
+ *
+ * The values are read directly instead of through u_is()/u_dict(): the point is
+ * to show what is actually there, including a class name that does not match.
+ * Worker thread only, like the rest of the chain; the throttle is one line per
+ * second so a several-minute session stays readable.
+ */
+static void ex_cls_name(uint64_t obj, char* out, size_t cap) {
+    uint64_t klass = PL(obj) ? u_klass(obj) : 0;
+    if (!klass || !u_class_name(klass, out, cap)) snprintf(out, cap, "?");
+}
+
+static void ex_slots_debug(uint64_t battle) {
+    static DWORD last;                 /* worker thread only */
+    DWORD now = GetTickCount();
+    if (last && now - last < 1000) return;
+    last = now;
+
+    /* battle + 0x4D0 -> BattleCharacterSlotsModel */
+    uint64_t model = PL(battle) ? rr_u64(battle + EX_OFF_BATTLE_SLOTS_MODEL) : 0;
+    int is_slots = u_is(model, "BattleCharacterSlotsModel");
+
+    /* model + 0x10 -> _slots dictionary; +0x18 entry array, +0x20 used count */
+    uint64_t dict = PL(model) ? rr_u64(model + EX_OFF_SLOTS_ARRAY) : 0;
+    int used = 0, cnt = 0, stride = 0;
+    uint64_t entries = 0, uentries = 0;
+    if (PL(dict)) {
+        rr_read(dict + EX_OFF_DICT_USED, &used, sizeof(used));
+        entries = rr_u64(dict + EX_OFF_DICT_ENTRIES);
+        u_dict(dict, &cnt, &uentries, &stride);
+    }
+
+    /* First row whose hash is not negative: row 0 can be a freed slot, which
+     * carries neither a key nor a value. */
+    int hash = 0, key = 0, row = -1, is_slot = 0, is_data = 0, eid = -1;
+    uint64_t key_q = 0, slot = 0, data = 0, ref = 0, desc = 0;
+    if (PL(entries)) {
+        enum { EX_DBG_ROWS = 64 };
+        uint8_t raw[EX_DBG_ROWS * EX_OFF_DICT_STRIDE];
+        int rows = used >= 1 && used <= EX_DBG_ROWS ? used : EX_DBG_ROWS;
+        if (rr_read(entries, raw, (size_t)rows * EX_OFF_DICT_STRIDE)) {
+            for (int i = 0; i < rows; ++i) {
+                const uint8_t* r = raw + (size_t)i * EX_OFF_DICT_STRIDE;
+                memcpy(&hash, r + EX_OFF_DICT_HASH, 4);
+                if (hash < 0) continue;
+                row = i;
+                memcpy(&key, r + EX_OFF_DICT_KEY, 4);
+                memcpy(&key_q, r + EX_OFF_DICT_KEY, 8);
+                memcpy(&slot, r + EX_OFF_DICT_VALUE, 8);
+                break;
+            }
+        }
+    }
+    /* row + 0x10 -> slot model; +0x10 -> _data_1; +0x20 -> EntityId reference,
+     * whose boxed int sits at +0x18 (same hops as ex_slots() / rr_hiding.h). */
+    if (PL(slot)) {
+        is_slot = u_is(slot, "BattleCharacterSlotModel");
+        data = rr_u64(slot + EX_OFF_SLOT_DATA);
+        desc = rr_u64(slot + EX_OFF_SLOT_DESC);
+    }
+    if (PL(data)) {
+        is_data = u_is(data, "BattleCharacterSlotData");
+        ref = rr_u64(data + EX_OFF_SLOT_ENTITY_ID);
+    }
+    if (PL(ref)) rr_read(ref + EX_OFF_PRIM_VALUE, &eid, sizeof(eid));
+
+    char battle_cls[64], model_cls[64], slot_cls[64], data_cls[64];
+    ex_cls_name(battle, battle_cls, sizeof(battle_cls));
+    ex_cls_name(model, model_cls, sizeof(model_cls));
+    ex_cls_name(slot, slot_cls, sizeof(slot_cls));
+    ex_cls_name(data, data_cls, sizeof(data_cls));
+
+    char path[MAX_PATH];
+    DWORD length = GetModuleFileNameA(NULL, path, MAX_PATH);
+    char* slash = length ? strrchr(path, '\\') : NULL;
+    if (!slash) return;
+    *(slash + 1) = 0;
+    strncat(path, "status.log", MAX_PATH - strlen(path) - 1);
+    FILE* f = fopen(path, "a");
+    if (!f) return;
+    /* The fields the diagnostic asks for come first, in order; the raw addresses
+     * and class names that follow say which hop produced them. key_q is the full
+     * 8 bytes behind first_key: a slot table keyed by a reference shows a heap
+     * pointer there instead of a small entity id. */
+    fprintf(f, "slots_debug: battle=0x%llX model=0x%llX is_slots=%d dict=0x%llX used=%d"
+               " first_key=%d first_eid=%d first_is_slot=%d first_is_data=%d"
+               " battle_cls=%s model_cls=%s slot_cls=%s data_cls=%s"
+               " row=%d hash=%d key_q=0x%llX slot=0x%llX data=0x%llX ref=0x%llX"
+               " desc=0x%llX desc_is_key=%d entries=0x%llX cnt=%d stride=%d\n",
+            (unsigned long long)battle, (unsigned long long)model, is_slots,
+            (unsigned long long)dict, used, key, eid, is_slot, is_data,
+            battle_cls, model_cls, slot_cls, data_cls,
+            row, hash, (unsigned long long)key_q, (unsigned long long)slot,
+            (unsigned long long)data, (unsigned long long)ref,
+            (unsigned long long)desc, desc != 0 && desc == key_q,
+            (unsigned long long)entries, cnt, stride);
+    fclose(f);
+}
+
 /* Slot entity ids. Both id sources (the dictionary key and the slot's own
- * EntityId) must agree, the same rule cache_roster_identity() applies. */
-static int ex_slots(uint64_t battle, int32_t* ids, int max) {
+ * EntityId) must agree, the same rule cache_roster_identity() applies.
+ *
+ * `seats` (optional) reports the size of the slot table: `_slots` holds one row
+ * per seat the battle created, and a seat without a player still has its row
+ * (its EntityId references -1, which is why rr_hiding.h skips id < 0). That is
+ * the only capacity the model exposes -- there is no _max/Capacity field in the
+ * dump -- so the free-seat count is seats - occupied, and this dictionary read
+ * is already paid for by the occupancy walk. */
+static int ex_slots(uint64_t battle, int32_t* ids, int max, int* seats) {
+    if (seats) *seats = 0;
     if (!u_is(battle, "BattleModel")) return -1;
     uint64_t model = rr_u64(battle + EX_OFF_BATTLE_SLOTS_MODEL);
     if (!u_is(model, "BattleCharacterSlotsModel")) return -1;
     EX_DICT dict;
     if (!ex_dict(rr_u64(model + EX_OFF_SLOTS_ARRAY), &dict)) return 0;
+    if (seats) *seats = dict.count;
     int n = ex_dict_rows(&dict, EX_MAX_SLOTS);
     if (n <= 0) return 0;
     int count = 0;
@@ -291,11 +413,12 @@ static int ex_roles(uint64_t battle, const int32_t* ids, int id_count,
     return count;
 }
 
-static void ex_cop_scan(uint64_t battle, int* cops, int* slots) {
+static void ex_cop_scan(uint64_t battle, int* cops, int* slots, int* seats) {
     *cops = 0;
     *slots = 0;
+    *seats = 0;
     static int32_t ids[EX_MAX_SLOTS];
-    int n = ex_slots(battle, ids, EX_MAX_SLOTS);
+    int n = ex_slots(battle, ids, EX_MAX_SLOTS, seats);
     if (n <= 0) return;
     *slots = n > EX_MAX_SLOTS ? EX_MAX_SLOTS : n;
     static EX_ROLE roles[EX_MAX_SLOTS];
@@ -416,6 +539,10 @@ void extras_refresh(uint64_t battle, uint64_t world, int force) {
     DWORD now = GetTickCount();
     if (!force && g_have_stamp && now - g_stamp < 400) return;
 
+    /* Diagnostic hook: runs before the early return below, so a count of zero can
+     * be read as "the chain is broken" or "no battle" instead of silently. */
+    if (cfg->debug_slots) ex_slots_debug(battle);
+
     int want_cops  = cfg->show_cop_counter != 0;
     int want_items = cfg->show_world_items != 0;
     int want_hide  = cfg->show_hide_objects != 0;
@@ -428,15 +555,16 @@ void extras_refresh(uint64_t battle, uint64_t world, int force) {
         ReleaseSRWLockExclusive(&g_lock);
         cfg->telem_cop_count = 0;
         cfg->telem_slot_total = 0;
+        cfg->telem_slot_seats = 0;
         g_stamp = now; g_have_stamp = 1;
         return;
     }
 
-    int cops = 0, slots = 0;
+    int cops = 0, slots = 0, seats = 0;
     static EXTRA_WORLD_ITEM staged[EXTRA_MAX_WORLD_ITEMS];
     int items = 0;
     int have_world = PL(world) && u_is(world, "WorldEntitiesModel");
-    if (want_cops && PL(battle)) ex_cop_scan(battle, &cops, &slots);
+    if (want_cops && PL(battle)) ex_cop_scan(battle, &cops, &slots, &seats);
     if (have_world && (want_items || want_hide)) {
         if (want_items) items = ex_world_items(world, staged, items, EXTRA_MAX_WORLD_ITEMS);
         if (want_hide)  items = ex_hide_items(world, staged, items, EXTRA_MAX_WORLD_ITEMS);
@@ -452,9 +580,11 @@ void extras_refresh(uint64_t battle, uint64_t world, int force) {
     g_slot_total = slots;
     ReleaseSRWLockExclusive(&g_lock);
 
-    /* The menu reads these through the existing telem: channel. */
+    /* The menu reads these through the existing telem: channel, and the overlay
+     * draws the cop HUD from the same three fields. */
     cfg->telem_cop_count = cops;
     cfg->telem_slot_total = slots;
+    cfg->telem_slot_seats = seats;
 
     g_stamp = now;
     g_have_stamp = 1;
