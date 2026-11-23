@@ -559,16 +559,17 @@ int extras_slots_probe(uint64_t battle_model) {
             uint64_t ref = PL(data) ? rr_u64(data + EX_OFF_SLOT_ENTITY_ID) : 0;
             int eid = -1;
             if (PL(ref)) rr_read(ref + EX_OFF_PRIM_VALUE, &eid, sizeof(eid));
-            char kc[64], vc[64], dc[64];
+            char kc[64], vc[64], dc[64], rc[64];
             ex_cls_name(key, kc, sizeof(kc));
             ex_cls_name(slot, vc, sizeof(vc));
             ex_cls_name(data, dc, sizeof(dc));
+            ex_cls_name(ref, rc, sizeof(rc));
             fprintf(f, "slots_layout: row=%d hash=%d next=%d dwords=%08X %08X %08X %08X %08X %08X"
                        " key=0x%llX (%s) slot=0x%llX (%s) pair=%d"
-                       " data=0x%llX (%s) eid=%d\n",
+                       " data=0x%llX (%s) ref=0x%llX (%s) eid=%d\n",
                     i, hash, next, d[0], d[1], d[2], d[3], d[4], d[5],
                     (unsigned long long)key, kc, (unsigned long long)slot, vc, pair,
-                    (unsigned long long)data, dc, eid);
+                    (unsigned long long)data, dc, (unsigned long long)ref, rc, eid);
         }
     }
 
