@@ -1023,6 +1023,7 @@ static int run_selftest(void) {
     written.world_item_distance = 1234;
     written.instant_loot = 1;
     written.debug_slots = 1;
+    written.debug_insta = 1;
     written.aa_los_on = 1;
     written.aa_closest_first = 1;
     written.show_loot = written.show_loot_nodes = written.vehicle_chams = 1;
@@ -1048,6 +1049,9 @@ static int run_selftest(void) {
     check(loaded.debug_slots == 1 && br_config_set(&loaded, "debug_slots", 7) &&
           loaded.debug_slots == 1,
           "config round trip saves the slots debug switch, clamped to 0..1");
+    check(loaded.debug_insta == 1 && br_config_set(&loaded, "debug_insta", 7) &&
+          loaded.debug_insta == 1,
+          "config round trip saves the instant loot debug switch, clamped to 0..1");
     check(BR_COL_HIDE_OBJECT == 38 && BR_COLOR_COUNT == 39 &&
           br_get()->color[BR_COL_HIDE_OBJECT].rgb[0] == 180 &&
           br_get()->color[BR_COL_HIDE_OBJECT].rgb[1] == 92 &&
@@ -1257,8 +1261,25 @@ static int run_selftest(void) {
           EX_OFF_DESC_SHINE == 0x40u && EX_OFF_DESC_ICON_REVEAL == 0x68u &&
           EX_OFF_DESC_GLOW_COLOR == 0x58u &&
           EX_INST_TIME_CELL_MAX == 5.0f && EX_INST_DURATION_MAX == 10.0f &&
-          EX_INST_MAX_ITEMS == 500 && EX_INST_TICK_MS == 250,
+          EX_INST_MAX_ITEMS == 500 && EX_INST_TICK_MS == 250 &&
+          EX_SWEEP_UPDATER_FROM == 0x60u && EX_SWEEP_UPDATER_TO == 0x130u &&
+          EX_SWEEP_SCREEN_FROM == 0x400u && EX_SWEEP_SCREEN_TO == 0x700u &&
+          EX_SWEEP_STEP == 8u && EX_SWEEP_MIN_MS == 2000 &&
+          ((EX_SWEEP_UPDATER_TO - EX_SWEEP_UPDATER_FROM) % EX_SWEEP_STEP) == 0u &&
+          ((EX_SWEEP_SCREEN_TO - EX_SWEEP_SCREEN_FROM) % EX_SWEEP_STEP) == 0u,
           "instant loot offsets match the 19/11/2026 table");
+    check(EX_SWEEP_UPDATER_FROM <= EX_OFF_UPDATER_TO_SCREEN &&
+          EX_OFF_UPDATER_TO_SCREEN <= EX_SWEEP_UPDATER_TO &&
+          EX_SWEEP_SCREEN_FROM <= EX_OFF_SCREEN_TO_INST &&
+          EX_OFF_SCREEN_TO_INST <= EX_SWEEP_SCREEN_TO,
+          "the offset sweeps cover the links they exist to replace");
+    /* The anchor instant loot compares its back pointer against is the entities
+     * model, reached through BattleModel + RR_OFF_BATTLE_ENTITIES. If those two
+     * offsets ever collide the resolution becomes a no-op and the tick dies at
+     * gate=back with every offset still correct, which is the failure this pins. */
+    check(RR_OFF_BATTLE_ENTITIES == 0x90u && RR_OFF_VIEWS_BATTLE == 0x18u &&
+          RR_OFF_BATTLE_ENTITIES != RR_OFF_VIEWS_BATTLE,
+          "instant loot resolves its anchor through BattleModel's entities model");
     {
         BR_Config* live = br_get();
         int saved = live->instant_loot;
@@ -1273,6 +1294,60 @@ static int run_selftest(void) {
         check(extras_insta_tick(0x100000, 0x200000) == 0,
               "instant loot rejects a pointer that is not a BattleEntitiesUpdater");
         live->instant_loot = saved;
+    }
+
+    /* 2c1. debug_insta: the diagnostic that has to say why a pass wrote nothing.
+     * The case exercised here is the one the live loop hits when it has no
+     * anchor at all -- the tick must still reach status.log, with every hop
+     * reading as "not reached" (0x0 pointers, count/time_cell = -1). Only the
+     * switch and the writer are exercised; the chain itself needs a live
+     * target. The switch is dropped for one call first so the 1/s throttle
+     * stamp is clear and this line cannot be swallowed. */
+    {
+        BR_Config* live = br_get();
+        int saved_loot = live->instant_loot, saved_dbg = live->debug_insta;
+        live->instant_loot = 1;
+        live->debug_insta = 0;
+        extras_insta_tick(0, 0);
+        live->debug_insta = 1;
+        extras_insta_tick(0, 0);
+        int found = 0, swept = 0;
+        char dpath[MAX_PATH];
+        DWORD dlen = GetModuleFileNameA(NULL, dpath, MAX_PATH);
+        char* dslash = dlen ? strrchr(dpath, '\\') : NULL;
+        if (dslash) {
+            *(dslash + 1) = 0;
+            strncat(dpath, "status.log", MAX_PATH - strlen(dpath) - 1);
+            FILE* df = fopen(dpath, "r");
+            if (df) {
+                char tail[4096];
+                tail[0] = 0;
+                if (fseek(df, 0, SEEK_END) == 0) {
+                    long size = ftell(df);
+                    long start = size > (long)sizeof(tail) - 1 ? size - (long)sizeof(tail) + 1 : 0;
+                    if (size > 0 && fseek(df, start, SEEK_SET) == 0) {
+                        size_t got = fread(tail, 1, sizeof(tail) - 1, df);
+                        tail[got] = 0;
+                        found = strstr(tail, "insta_debug: updater=0x0 is_updater=0 screen=0x0"
+                                            " inst=0x0 time_cell=-1.0000 list=0x0 count=-1"
+                                            " writes=0 battle=0x0 back=0x0 gate=anchor"
+                                            " probe=0x0 probe_cls=\"\"") != NULL;
+                        /* With no anchor there is nothing to sweep either, so the
+                         * summary line must still be emitted: it is what proves
+                         * the sweep ran and found nothing, rather than not
+                         * running at all. */
+                        swept = strstr(tail, "insta_sweep: updater_hits=0 screen_hits=0"
+                                            " step=8 ranges=0x060..0x130,0x400..0x700"
+                                            " updater=0x0 battle=0x0 back=0x0") != NULL;
+                    }
+                }
+                fclose(df);
+            }
+        }
+        live->debug_insta = saved_dbg;
+        live->instant_loot = saved_loot;
+        check(found, "insta debug writes a status.log line with no anchor");
+        check(swept, "insta sweep reports an empty sweep instead of staying silent");
     }
 
     /* 3. projection math: camera at origin looking +Z, 90 deg vertical FOV */

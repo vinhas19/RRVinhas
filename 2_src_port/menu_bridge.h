@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define BR_MAGIC 0x57444D31u
-#define BR_VERSION 18u
+#define BR_VERSION 19u
 
 /* Named colour slots shared by the menu and the renderer.
  * 0..14 keep their historical order so existing CoreRR.cfg files load
@@ -139,7 +139,8 @@ static int br_color_is_legacy(int id) {
     X(show_hide_objects, 0, 0, 1) \
     X(world_item_distance, 500, 50, 5000) \
     X(instant_loot, 0, 0, 1) \
-    X(debug_slots, 0, 0, 1)   /* slot-chain diagnostic: slots_debug lines in status.log */
+    X(debug_slots, 0, 0, 1)   /* slot-chain diagnostic: slots_debug lines in status.log */ \
+    X(debug_insta, 0, 0, 1)   /* instant loot diagnostic: insta_debug line in status.log */
 
 typedef struct BR_Config {
     unsigned int magic, version;

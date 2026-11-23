@@ -184,6 +184,91 @@ written. The loop is stopped and joined by `extras_reset()` before teardown.
 The self-test checks the offsets, that the switch round trips, and that the off,
 null-pointer and bogus-pointer paths all return zero writes.
 
+Instant loot fails closed, so a broken hop and an empty container look the same:
+nothing is written, no crash, items reveal one by one. `debug_insta` (default 0,
+in `CoreRR.cfg`; not a World-tab switch) makes `extras_insta_tick()` append one
+`insta_debug:` line per second to `status.log` beside the overlay:
+
+```
+insta_debug: updater=0x1A2B... is_updater=1 screen=0x1A2C... inst=0x1A2D...
+             time_cell=0.9813 list=0x1A2E... count=4 writes=9 battle=0x1A2F...
+             back=0x1A2F... gate=ok probe=0x1A2D... probe_cls="InventoryRevealViewDescriptions"
+```
+
+The line holds five hops in walk order. `updater` is the pointer the loop got
+from `game_scene_debug()`; `is_updater` is its `BattleEntitiesUpdater` class
+check; `screen` is `updater + 0x68`; `inst` is `screen + 0x540`; `time_cell` is
+`inst + 0x58` (`TimeToOneCellBorder`); `list`/`count` are `inst + 0x18` and that
+list's size; `writes` is the number of `rr_write()` calls that succeeded in the
+pass. Values start at "not reached" and stop being filled the moment a hop
+fails, so the first `0x0` (or `count=-1` / `time_cell=-1.0000`) names the broken
+link. `time_cell` past 0..5 s is the tripwire refusing the write, `count=0` is an
+empty list, and a live `time_cell` with `writes=0` means the write path itself
+failed. A whole run with no `insta_debug:` line at all means the loop never
+reached the tick: the switch is off, or `g_inst_battle` was never armed.
+
+The tail says *which* test stopped the pass, which the hop values alone cannot:
+
+- `battle` is the anchor the pass compared against, `back` is
+  `updater + 0x18` (`BattleEntitiesUpdater._battleEntitiesModel`), i.e. the two
+  sides of that comparison.
+- `gate` is the first test that failed, in walk order: `anchor` (no usable
+  battle/updater), `class` (not a `BattleEntitiesUpdater`), `link` (`screen`
+  null), `back` (`back != battle`), `inst` (`screen + 0x540` null), or `ok`.
+- `probe` is `screen + 0x540` read even when the gate failed, and `probe_cls`
+  names it -- so `gate=back probe=0x... probe_cls="InventoryRevealViewDescriptions"`
+  reads as "the object is live, the anchor is the wrong object", while
+  `gate=inst probe=0x0` reads as "the offset moved".
+
+`gate=back` with a live `probe` was a real failure: instant loot was armed with
+the **BattleModel** while the tick compares against the **BattleEntitiesModel**,
+so every pass stopped at the back-pointer test and `inst` was never read, with
+every offset still correct. `extras_refresh()` now resolves the entities model
+(BattleModel `+0x90`) before arming. The loop also hands the tick the battle
+`game_scene_debug()` resolves for the pass instead of the anchor published up to
+400 ms earlier, so a stale anchor cannot hide the path; the tick's own chain
+remains the only write gate. Two more lines make that visible at 1/s:
+
+```
+insta_arm:  anchor=0x1A2F... prev=0x0 cls="BattleEntitiesModel" armed=1
+insta_loop: battle=0x1A2F... ub=0x1A2F... same=1 updater=0x1A2B...
+            updater_cls="BattleEntitiesUpdater" back=0x1A2F...
+            back_is_ub=1 back_is_battle=1 back_cls="BattleEntitiesModel"
+```
+
+`insta_arm` is written once per change of the anchor, `insta_loop` once per
+second while `debug_insta` is on. `back_is_ub=1` is the condition the write gate
+needs; `back_is_battle=0` would repeat the arming bug above.
+
+When the chain breaks at `inst`, that line cannot say which of the two links
+moved, so the same pass also sweeps both parents and names every candidate by
+class -- once every 2 s, and only while `inst` is null:
+
+```
+insta_sweep_updater: off=0x068 obj=0x1A2C... cls="BattleScreenContent" is_screen=1
+                     probe=0x540 inst=0x0 inst_cls="?" battle=0x1A2B... back=0x1A2B...
+insta_sweep_screen:  off=0x4F8 obj=0x1A2D... cls="InventoryRevealViewDescriptions"
+                     match=name+shape cell=0.9813 list=0x1A2E... count=4
+insta_sweep: updater_hits=1 screen_hits=1 step=8 ranges=0x060..0x130,0x400..0x700
+             updater=0x1A2B... battle=0x1A2F... back=0x1A2F...
+```
+
+`insta_sweep_updater` walks `BattleEntitiesUpdater +0x60..0x130` and prints every
+slot whose class name says screen/view; `is_screen=1` marks the exact
+`BattleScreenContent` type and `probe` shows what `screen + 0x540` yields on it,
+so a *second* slot with a non-null `inst` is the content link this build uses.
+`back` is the back pointer: equal to `battle` means the updater belongs to the
+current battle, different means the anchor changed rather than an offset.
+`insta_sweep_screen` walks `BattleScreenContent +0x400..0x700` and prints every
+slot that either names a view or fits the reveal view's shape -- `cell` inside
+0..5 s together with `count` equal to the items in the open container -- so a
+renamed type is still found; `match=` says which test hit. `insta_sweep:` closes
+the block with the candidate count and repeats the three pointers so a zero-hit
+sweep still says which updater/battle pair it walked, and `screen_hits=0` with a
+container open is a result too: nothing in that range matches. The sweeps are
+read-only, are not part of the write path, and are capped at 24 candidate lines
+each.
+
 `--probe`, write tests, memory searches and other diagnostics have different
 requirements and side effects. Read their dispatch branches and implementations
 in `rr_esp.c` before running them.

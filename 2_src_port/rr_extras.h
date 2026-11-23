@@ -128,6 +128,33 @@ extern "C" {
 #define EX_INST_MAX_ITEMS           500     /* list sanity cap                 */
 #define EX_INST_TICK_MS             250     /* loop period while a container is open */
 
+/* --- Offset sweeps for the two links a build can move --------------------
+ * Only the debug_insta diagnostic reads these; no write path uses them. When a
+ * link comes back null the sweep walks the pointer slots of the parent object
+ * and names every candidate by class, so a moved offset is found in one live
+ * run instead of one run per guess. Both sweeps print into status.log beside
+ * the executable, next to the insta_debug line that triggered them.
+ *
+ *   insta_sweep_updater: off=0x070 obj=0x... cls="BattleScreenContent"
+ *                        is_screen=1 probe=0x540 inst=0x... inst_cls="?"
+ *                        battle=0x... back=0x...
+ *   insta_sweep_screen:  off=0x4F8 obj=0x... cls="InventoryRevealView"
+ *                        cell=3.2000 list=0x... count=7
+ *   insta_sweep:         updater_hits=1 screen_hits=2 step=8 ranges=...
+ *
+ * off is the slot in the parent, probe the known screen -> inst offset read on
+ * the candidate. A screen candidate is the reveal view when cell is the live
+ * 0..5 s cell-border timer (EX_OFF_INST_TIME_CELL) and count matches the items
+ * in the open container, so sweep with a container open. updater_hits=0 /
+ * screen_hits=0 is a result too: nothing in range carries a matching class, so
+ * the type was renamed or the object is not reachable from this parent. */
+#define EX_SWEEP_UPDATER_FROM       0x060u  /* BattleEntitiesUpdater slots     */
+#define EX_SWEEP_UPDATER_TO         0x130u  /* inclusive                       */
+#define EX_SWEEP_SCREEN_FROM        0x400u  /* BattleScreenContent slots       */
+#define EX_SWEEP_SCREEN_TO          0x700u  /* inclusive                       */
+#define EX_SWEEP_STEP               8u      /* one pointer per slot            */
+#define EX_SWEEP_MIN_MS             2000    /* re-sweep period while a link is null */
+
 /* --- IL2CPP object layout (rr_unity.h map) ------------------------------ */
 #define EX_OFF_OBJ_CLASS            0x00u           /* Il2CppObject.klass    */
 #define EX_OFF_OBJ_NAME_ASCII       U_CLASS_NAME    /* 0x010 Il2CppClass.name */
@@ -172,7 +199,22 @@ int extras_world_snapshot(EXTRA_WORLD_ITEM* out, int max);
  * when the switch is off, when either pointer is null (no container open), when
  * a pointer fails its class check, or when a duration reads outside its bound.
  * The self-test calls it with null and bogus pointers to prove those paths
- * write nothing. */
+ * write nothing.
+ *
+ * With debug_insta on (default 0) each pass also appends at most one line per
+ * second to status.log:
+ *
+ *   insta_debug: updater=0x... is_updater=1 screen=0x... inst=0x...
+ *                time_cell=0.0000 list=0x... count=3 writes=6
+ *
+ * The first pointer that reads as 0x0 from the start of the chain is the hop
+ * that broke; count=-1 or time_cell=-1.0000 means the walk stopped before that
+ * field (time_cell also shows a value that failed the 0..5 s bound), count=0 is
+ * an empty list, and writes counts rr_write() calls that succeeded. While inst
+ * is null the pass also sweeps both parents (EX_SWEEP_* above) every
+ * EX_SWEEP_MIN_MS and appends insta_sweep_updater / insta_sweep_screen /
+ * insta_sweep lines, which names the link that moved instead of only reporting
+ * that it is gone. */
 int extras_insta_tick(uint64_t battle, uint64_t updater);
 
 /* Drop the publication (detach, world change) and stop the instant loot loop. */

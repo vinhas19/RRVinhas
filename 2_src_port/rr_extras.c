@@ -919,8 +919,28 @@ void extras_refresh(uint64_t battle, uint64_t world, int force) {
     BR_Config* cfg = br_get();
     /* Arm or disarm the instant loot loop before the throttle: the loop needs
      * the battle anchor, and this worker is the only place that has it. With
-     * the switch off the anchor is 0 and no pass runs. */
-    ex_inst_arm(cfg->instant_loot ? battle : 0);
+     * the switch off the anchor is 0 and no pass runs.
+     *
+     * The anchor instant loot compares against is the *entities* model
+     * (BattleEntitiesUpdater + RR_OFF_VIEWS_BATTLE), but callers hand this
+     * function the BattleModel, because that is what ex_slots() needs (the seat
+     * table hangs off its +0x4D0). Arming the BattleModel put two different
+     * types on the two sides of that comparison, so the tick never passed its
+     * back-pointer test, never read screen + 0x540, and instant loot stopped
+     * writing while every offset was still correct. Resolve the entities model
+     * here and leave the tick's comparison strict; both shapes are accepted so
+     * the teardown calls and any caller that already has the entities model
+     * keep working. */
+    uint64_t anchor = 0;
+    if (PL(battle)) {
+        if (u_is(battle, "BattleEntitiesModel")) {
+            anchor = battle;
+        } else {
+            uint64_t entities = rr_u64(battle + RR_OFF_BATTLE_ENTITIES);
+            if (u_is(entities, "BattleEntitiesModel")) anchor = entities;
+        }
+    }
+    ex_inst_arm(cfg->instant_loot ? anchor : 0);
     DWORD now = GetTickCount();
     if (!force && g_have_stamp && now - g_stamp < 400) return;
 
@@ -1012,30 +1032,208 @@ static int ex_float_write(uint64_t addr, float value) {
     return rr_write(addr, &value, sizeof(value));
 }
 
-int extras_insta_tick(uint64_t battle, uint64_t updater) {
-    /* One read of the switch decides whether this pass may write at all. */
-    if (!br_get()->instant_loot) return 0;
-    if (!PL(battle) || !PL(updater)) return 0;
-    if (!u_is(updater, "BattleEntitiesUpdater")) return 0;
-    if (rr_u64(updater + RR_OFF_VIEWS_BATTLE) != battle) return 0;
+/* The same read without the range gate. Only the debug line uses it: a duration
+ * that reads outside its bound is exactly the value the diagnostic has to show,
+ * and leaving the caller's sentinel in place says the field did not read at all. */
+static int ex_float_any(uint64_t addr, float* out) {
+    float v = 0.0f;
+    if (!PL(addr) || !rr_read(addr, &v, sizeof(v)) || !isfinite(v)) return 0;
+    *out = v;
+    return 1;
+}
 
-    /* Both links must be live: closing the container nulls the content link,
-     * and that is the signal to stop writing. */
-    uint64_t screen = rr_u64(updater + EX_OFF_UPDATER_TO_SCREEN);
-    if (!PL(screen)) return 0;
-    uint64_t inst = rr_u64(screen + EX_OFF_SCREEN_TO_INST);
-    if (!PL(inst)) return 0;
+/* --- Offset sweeps for the two links a build can move -------------------
+ * Reached only from ex_insta_debug(), i.e. only with debug_insta on and only
+ * while the chain is broken: a null inst cannot say whether the updater ->
+ * screen slot moved, the screen -> inst slot moved, or the back pointer did.
+ * Both parents are then walked slot by slot and every candidate is named by
+ * class, which turns "the offset moved" into one live run instead of one per
+ * guess. Nothing here writes and nothing here is on the instant loot path. */
 
+/* The filter is the class *name*, not u_is(): if the build renamed the view,
+ * an exact match on the old name would reject the very object the sweep exists
+ * to find. "Screen" is in the list so BattleScreenContent itself shows up in
+ * the updater sweep, which is how a second content slot is spotted. */
+static const char* const g_ex_sweep_names[] = { "Inventory", "Reveal", "View", "Screen" };
+#define EX_SWEEP_NAMES ((int)(sizeof(g_ex_sweep_names) / sizeof(g_ex_sweep_names[0])))
+
+/* A parent with more matching sub-models than this in one range would flood the
+ * log; the first EX_SWEEP_MAX_LINES candidates of a sweep are printed, then a
+ * line says the range was cut. */
+enum { EX_SWEEP_MAX_LINES = 24 };
+
+static DWORD g_insta_sweep_last = 0;   /* worker thread only, like the throttle */
+
+/* Class name of obj and whether it matched one of the sweep names. ex_cls_name
+ * leaves "?" when the name does not read, so garbage slots never match. */
+static int ex_sweep_named(uint64_t obj, char* name, size_t cap) {
+    ex_cls_name(obj, name, cap);
+    for (int i = 0; i < EX_SWEEP_NAMES; ++i)
+        if (strstr(name, g_ex_sweep_names[i])) return 1;
+    return 0;
+}
+
+/* List<T>._size of a candidate list, -1 when it could not be reached. */
+static int ex_sweep_count(uint64_t list) {
+    int32_t count = 0;
+    if (!PL(list) || !rr_read(list + EX_OFF_LIST_COUNT, &count, sizeof(count))) return -1;
+    return count;
+}
+
+/* BattleEntitiesUpdater: every slot in EX_SWEEP_UPDATER_FROM..TO that names a
+ * screen, and what the known screen -> inst offset yields on it. A slot other
+ * than EX_OFF_UPDATER_TO_SCREEN whose probe is non-null is the content link
+ * this build uses; is_screen=1 lists every BattleScreenContent the updater
+ * carries. back is the back pointer at RR_OFF_VIEWS_BATTLE, printed so a
+ * changed back pointer (not a moved offset) is visible as such. Returns the
+ * number of candidates printed. */
+static int ex_sweep_updater(FILE* f, uint64_t updater, uint64_t battle, uint64_t back) {
+    int shown = 0;
+    for (unsigned off = EX_SWEEP_UPDATER_FROM; off <= EX_SWEEP_UPDATER_TO; off += EX_SWEEP_STEP) {
+        uint64_t obj = rr_u64(updater + off);
+        char cls[96];
+        if (!PL(obj) || !ex_sweep_named(obj, cls, sizeof(cls))) continue;
+        uint64_t inst = rr_u64(obj + EX_OFF_SCREEN_TO_INST);
+        char icls[96];
+        ex_cls_name(inst, icls, sizeof(icls));
+        fprintf(f, "insta_sweep_updater: off=0x%03X obj=0x%llX cls=\"%s\" is_screen=%d"
+                   " probe=0x%X inst=0x%llX inst_cls=\"%s\" battle=0x%llX back=0x%llX\n",
+                off, (unsigned long long)obj, cls, u_is(obj, "BattleScreenContent"),
+                EX_OFF_SCREEN_TO_INST, (unsigned long long)inst, icls,
+                (unsigned long long)battle, (unsigned long long)back);
+        if (++shown >= EX_SWEEP_MAX_LINES) {
+            fprintf(f, "insta_sweep_updater: range cut at 0x%03X (%d lines)\n",
+                    off, EX_SWEEP_MAX_LINES);
+            break;
+        }
+    }
+    return shown;
+}
+
+/* BattleScreenContent: every slot in EX_SWEEP_SCREEN_FROM..TO that either names
+ * a view or fits the reveal view's shape, with the cell timer and the list
+ * count read at the offsets the walk already uses. A candidate is the reveal
+ * view when cell sits in 0..EX_INST_TIME_CELL_MAX and count is the number of
+ * items in the open container; the shape test survives a rename that drops
+ * every word in g_ex_sweep_names. Returns the number of candidates printed. */
+static int ex_sweep_screen(FILE* f, uint64_t screen) {
+    int shown = 0;
+    for (unsigned off = EX_SWEEP_SCREEN_FROM; off <= EX_SWEEP_SCREEN_TO; off += EX_SWEEP_STEP) {
+        uint64_t obj = rr_u64(screen + off);
+        if (!PL(obj)) continue;
+        char cls[96];
+        int by_name = ex_sweep_named(obj, cls, sizeof(cls));
+        /* cell keeps -1 for "did not read" distinct from a zero, the same way
+         * the insta_debug line does. */
+        float cell = -1.0f;
+        int cell_ok = ex_float_in(obj + EX_OFF_INST_TIME_CELL, EX_INST_TIME_CELL_MAX, &cell);
+        if (!cell_ok) ex_float_any(obj + EX_OFF_INST_TIME_CELL, &cell);
+        uint64_t list = rr_u64(obj + EX_OFF_INST_LIST);
+        int count = ex_sweep_count(list);
+        int by_shape = cell_ok && PL(list) && count > 0 && count <= EX_INST_MAX_ITEMS;
+        if (!by_name && !by_shape) continue;
+        fprintf(f, "insta_sweep_screen: off=0x%03X obj=0x%llX cls=\"%s\" match=%s"
+                   " cell=%.4f list=0x%llX count=%d\n",
+                off, (unsigned long long)obj, cls,
+                by_name && by_shape ? "name+shape" : by_name ? "name" : "shape",
+                cell, (unsigned long long)list, count);
+        if (++shown >= EX_SWEEP_MAX_LINES) {
+            fprintf(f, "insta_sweep_screen: range cut at %d lines\n", EX_SWEEP_MAX_LINES);
+            break;
+        }
+    }
+    return shown;
+}
+
+/* One insta_debug line per second while debug_insta is on, appended to
+ * status.log beside the overlay like the slots_debug lines. A 0 pointer, a count
+ * of -1 or a time_cell of -1 means that hop was never reached (or did not read),
+ * never "zero"; writes counts the rr_write() calls that succeeded, so a live
+ * timer together with writes=0 is a failing write path. The stamp is cleared
+ * whenever a pass sees the switch off (extras_insta_tick), so the first line
+ * after enabling it is never swallowed by the throttle. Instant loot loop
+ * thread only in production; the self-test reaches it from the main thread.
+ *
+ * The tail of the line is what localises a broken pass: battle/back are the two
+ * values the back-pointer test compares, gate names the first test that failed
+ * (anchor, class, link, back, inst - or ok), and probe is what screen + its
+ * slot reads even when that test failed, with probe_cls naming the object.
+ *
+ * While inst is null the two offset sweeps run too, on a slower period of their
+ * own (EX_SWEEP_MIN_MS): the per-slot insta_sweep_updater / insta_sweep_screen
+ * lines name every candidate the parent carries, and the closing insta_sweep:
+ * line reports the candidate count even when it is zero, which is a result in
+ * itself (nothing in range matches, so the type was renamed or the object hangs
+ * off a different parent). Both are pure reads. */
+static DWORD g_insta_dbg_last = 0;
+
+static void ex_insta_debug(uint64_t battle, uint64_t updater, int is_updater,
+                           uint64_t screen, uint64_t back, uint64_t inst,
+                           float time_cell, uint64_t list, int count, int writes,
+                           const char* gate, uint64_t probe) {
+    DWORD now = GetTickCount();
+    if (g_insta_dbg_last && now - g_insta_dbg_last < 1000) return;
+    g_insta_dbg_last = now;
+
+    /* Naming the probe object is what separates "the link holds the reveal view
+     * and only the anchor is wrong" from "the link holds something else". */
+    char pcls[96];
+    pcls[0] = 0;
+    if (PL(probe)) ex_cls_name(probe, pcls, sizeof(pcls));
+
+    FILE* f = ex_status_open();
+    if (!f) return;
+    fprintf(f, "insta_debug: updater=0x%llX is_updater=%d screen=0x%llX inst=0x%llX"
+               " time_cell=%.4f list=0x%llX count=%d writes=%d"
+               " battle=0x%llX back=0x%llX gate=%s probe=0x%llX probe_cls=\"%s\"\n",
+            (unsigned long long)updater, is_updater, (unsigned long long)screen,
+            (unsigned long long)inst, time_cell, (unsigned long long)list,
+            count, writes, (unsigned long long)battle, (unsigned long long)back,
+            gate ? gate : "?", (unsigned long long)probe, pcls);
+    /* A null inst is the one failure the line above cannot localise, so sweep
+     * both parents while it is null. The sweep keeps its own slower period and
+     * only re-arms when a pass sees a live inst, which keeps the log bounded
+     * for a container that stays open. */
+    if (!PL(inst)) {
+        if (!g_insta_sweep_last || now - g_insta_sweep_last >= EX_SWEEP_MIN_MS) {
+            g_insta_sweep_last = now;
+            int nu = is_updater ? ex_sweep_updater(f, updater, battle, back) : 0;
+            int ns = PL(screen) ? ex_sweep_screen(f, screen) : 0;
+            fprintf(f, "insta_sweep: updater_hits=%d screen_hits=%d step=%u"
+                       " ranges=0x%03X..0x%03X,0x%03X..0x%03X"
+                       " updater=0x%llX battle=0x%llX back=0x%llX\n",
+                    nu, ns, EX_SWEEP_STEP, EX_SWEEP_UPDATER_FROM, EX_SWEEP_UPDATER_TO,
+                    EX_SWEEP_SCREEN_FROM, EX_SWEEP_SCREEN_TO,
+                    (unsigned long long)updater, (unsigned long long)battle,
+                    (unsigned long long)back);
+        }
+    } else {
+        g_insta_sweep_last = 0;   /* a working chain re-arms the next sweep */
+    }
+    fclose(f);
+}
+
+/* The write pass over a validated InventoryRevealViewDescriptions. Reports what
+ * it saw for the debug line: *time_cell is the cell-border duration read before
+ * it was zeroed (-1 when it did not read, or the offending value when it failed
+ * the bound), *plist the List<Pair> and *pcount its size (-1 when the list could
+ * not be reached, 0 for an empty one). Returns the number of successful writes. */
+static int ex_insta_walk(uint64_t inst, float* time_cell, uint64_t* plist, int* pcount) {
     int wrote = 0;
-    float time_cell = 0.0f;
-    if (!ex_float_in(inst + EX_OFF_INST_TIME_CELL, EX_INST_TIME_CELL_MAX, &time_cell))
+    *plist = 0;
+    *pcount = -1;
+    if (!ex_float_in(inst + EX_OFF_INST_TIME_CELL, EX_INST_TIME_CELL_MAX, time_cell)) {
+        ex_float_any(inst + EX_OFF_INST_TIME_CELL, time_cell);   /* the tripwire value */
         return 0;   /* not the object we expect: touch nothing */
-    if (time_cell > 0.0f && ex_float_write(inst + EX_OFF_INST_TIME_CELL, 0.0f)) ++wrote;
+    }
+    if (*time_cell > 0.0f && ex_float_write(inst + EX_OFF_INST_TIME_CELL, 0.0f)) ++wrote;
 
     uint64_t list = rr_u64(inst + EX_OFF_INST_LIST);
     if (!PL(list)) return wrote;
+    *plist = list;
     int32_t count = 0;
     if (!rr_read(list + EX_OFF_LIST_COUNT, &count, sizeof(count))) return wrote;
+    *pcount = count;
     if (count <= 0 || count > EX_INST_MAX_ITEMS) return wrote;   /* sanity */
     uint64_t items = rr_u64(list + EX_OFF_LIST_ITEMS);
     if (!PL(items)) return wrote;
@@ -1056,6 +1254,95 @@ int extras_insta_tick(uint64_t battle, uint64_t updater) {
     return wrote;
 }
 
+int extras_insta_tick(uint64_t battle, uint64_t updater) {
+    /* One read of the switch decides whether this pass may write at all. */
+    BR_Config* cfg = br_get();
+    if (!cfg->instant_loot) return 0;
+
+    /* State for the debug line, filled in as the chain is walked. Every value
+     * starts at "not reached" so a line that stops early still says where. */
+    uint64_t screen = 0, inst = 0, list = 0, back = 0, probe = 0;
+    int is_updater = 0, count = -1, wrote = 0;
+    float time_cell = -1.0f;
+    /* Which test ended the chain, in walk order. Without it a line cannot tell
+     * "the anchor is another type" (back) from "the link is null" (inst), and
+     * those two need opposite fixes: the first is an arming bug, the second a
+     * moved offset. */
+    const char* gate = "anchor";   /* battle or updater not usable            */
+
+    if (PL(battle) && PL(updater)) {
+        gate = "class";
+        is_updater = u_is(updater, "BattleEntitiesUpdater") ? 1 : 0;
+        /* screen and the back pointer are read before the back-pointer test so
+         * the line can tell a missing content link from an updater that belongs
+         * to another battle, and so the sweep can report both. */
+        if (is_updater) {
+            screen = rr_u64(updater + EX_OFF_UPDATER_TO_SCREEN);
+            back = rr_u64(updater + RR_OFF_VIEWS_BATTLE);
+            /* The link is read even when the back-pointer test fails: probe is
+             * what screen + its slot holds right now, so a broken pass can say
+             * "the object is there, the anchor is wrong" instead of reporting
+             * two nulls. Read only - the walk and every write stay behind the
+             * whole chain. */
+            if (PL(screen)) probe = rr_u64(screen + EX_OFF_SCREEN_TO_INST);
+            if (!PL(screen)) {
+                gate = "link";     /* updater carries no BattleScreenContent   */
+            } else if (back != battle) {
+                gate = "back";     /* anchor is not the object the updater
+                                    * points back at; no link is trusted      */
+            } else if (!PL(probe)) {
+                gate = "inst";     /* EX_OFF_SCREEN_TO_INST moved or was nulled */
+            } else {
+                gate = "ok";
+                inst = probe;
+                wrote = ex_insta_walk(inst, &time_cell, &list, &count);
+            }
+        }
+    }
+    if (cfg->debug_insta)
+        ex_insta_debug(battle, updater, is_updater, screen, back, inst,
+                       time_cell, list, count, wrote, gate, probe);
+    else {
+        g_insta_dbg_last = 0;     /* the first pass after enabling always writes */
+        g_insta_sweep_last = 0;   /* ...and the first broken pass sweeps at once */
+    }
+    return wrote;
+}
+
+/* One insta_loop line per second while debug_insta is on: the two halves the
+ * tick joins, printed before the tick so the pair can be read side by side.
+ * battle is the anchor the extras worker published (what the tick used to be
+ * given), ub the battle game_scene_debug() reports for this pass (what the
+ * tick is given now) and back what the updater points at, RR_OFF_VIEWS_BATTLE.
+ * back == ub is the condition the write gate needs; back == battle is the one
+ * it had when the anchor was a BattleModel and every pass died there. Its own
+ * 1/s stamp, independent of the insta_debug throttle. */
+static DWORD g_insta_loop_last = 0;
+
+static void ex_insta_loop_debug(uint64_t battle, uint64_t ub, uint64_t updater) {
+    DWORD now = GetTickCount();
+    if (g_insta_loop_last && now - g_insta_loop_last < 1000) return;
+
+    uint64_t back = 0;
+    char ucls[96], bcls[96];
+    ucls[0] = bcls[0] = 0;
+    if (PL(updater)) ex_cls_name(updater, ucls, sizeof(ucls));
+    if (PL(updater)) back = rr_u64(updater + RR_OFF_VIEWS_BATTLE);
+    if (PL(back)) ex_cls_name(back, bcls, sizeof(bcls));
+
+    FILE* f = ex_status_open();
+    if (!f) return;
+    g_insta_loop_last = now;
+    fprintf(f, "insta_loop: battle=0x%llX ub=0x%llX same=%d updater=0x%llX"
+               " updater_cls=\"%s\" back=0x%llX back_is_ub=%d back_is_battle=%d"
+               " back_cls=\"%s\"\n",
+            (unsigned long long)battle, (unsigned long long)ub,
+            (battle && battle == ub) ? 1 : 0, (unsigned long long)updater, ucls,
+            (unsigned long long)back, (back && back == ub) ? 1 : 0,
+            (back && back == battle) ? 1 : 0, bcls);
+    fclose(f);
+}
+
 /* 250 ms loop. It never touches the target directly: each pass re-validates the
  * anchor and hands the tick a pointer the game's own discovery worker published
  * (g_views_updater, which views_updater_valid() already accepted). Sleeping in
@@ -1068,8 +1355,20 @@ static DWORD WINAPI ex_inst_loop(LPVOID unused) {
         if (battle && br_get()->instant_loot) {
             uint64_t ub = 0, updater = 0;
             game_scene_debug(&ub, &updater, NULL);
-            if (updater && ub == (uint64_t)battle)
-                extras_insta_tick((uint64_t)battle, updater);
+            int debug = br_get()->debug_insta;
+            if (debug) ex_insta_loop_debug((uint64_t)battle, ub, updater);
+            else g_insta_loop_last = 0;   /* first line after enabling shows */
+            /* The tick's own chain is the gate: it re-reads the class, the
+             * content link, the back pointer and the timers, and writes only
+             * once all of them pass. Handing it the battle this pass resolved
+             * instead of the anchor published up to 400 ms ago is what keeps a
+             * stale anchor from hiding the whole path: the old gate
+             * (updater && ub == battle) then skipped the tick entirely, so an
+             * anchor of the wrong type looked exactly like a dead offset. The
+             * armed anchor is still what arms disarms the loop, and it is used
+             * as the fallback pointer when no validated battle is resolved. */
+            if (updater && (ub || debug))
+                extras_insta_tick(ub ? ub : (uint64_t)battle, updater);
         }
         for (int i = 0; i < EX_INST_TICK_MS / 50; ++i) {
             if (InterlockedCompareExchange(&g_inst_stop, 0, 0)) return 0;
@@ -1083,6 +1382,7 @@ static DWORD WINAPI ex_inst_loop(LPVOID unused) {
  * next stop request or idles until a new anchor arrives. */
 static void ex_inst_arm(uint64_t battle) {
     AcquireSRWLockExclusive(&g_inst_lock);
+    LONG64 prev = g_inst_battle;
     InterlockedExchange64(&g_inst_battle, (LONG64)battle);
     if (battle && !g_inst_thread && g_inst_clean) {
         InterlockedExchange(&g_inst_stop, 0);
@@ -1090,6 +1390,21 @@ static void ex_inst_arm(uint64_t battle) {
         InterlockedExchange(&g_inst_clean, g_inst_thread ? 0 : 1);
     }
     ReleaseSRWLockExclusive(&g_inst_lock);
+    /* One line per change, outside the lock: the anchor every pass compares its
+     * back pointer against, named, so an anchor of the wrong type shows up as
+     * *this* line instead of as every pass stopping at gate=back. */
+    if ((uint64_t)prev != battle && br_get()->debug_insta) {
+        char cls[96];
+        cls[0] = 0;
+        if (PL(battle)) ex_cls_name(battle, cls, sizeof(cls));
+        FILE* f = ex_status_open();
+        if (f) {
+            fprintf(f, "insta_arm: anchor=0x%llX prev=0x%llX cls=\"%s\" armed=%d\n",
+                    (unsigned long long)battle, (unsigned long long)prev, cls,
+                    battle ? 1 : 0);
+            fclose(f);
+        }
+    }
 }
 
 /* Stop the loop and wait for it. A join that times out is never retried, so two
