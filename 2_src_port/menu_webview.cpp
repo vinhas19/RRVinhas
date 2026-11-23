@@ -368,8 +368,8 @@ static LRESULT WINAPI wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l){
             SetTextColor(dc, RGB(241, 235, 251));
             SetBkMode(dc, TRANSPARENT);
             const wchar_t* text = FAILED(g_start_error)
-                ? L"Felonious Funnery could not open WebView2. See wv2_error.log. Press F1 to close."
-                : L"Loading Felonious Funnery...";
+                ? L"Vinhasxyz could not open WebView2. See wv2_error.log. Press F1 to close."
+                : L"Loading Vinhasxyz...";
             DrawTextW(dc, text, -1, &rect, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
         }
         EndPaint(h, &paint);

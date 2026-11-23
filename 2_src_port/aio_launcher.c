@@ -154,11 +154,11 @@ static void fail(const wchar_t* fmt, ...) {
     log_add(L"FAILED: %s", buf);
     if (g_wnd) SetWindowTextW(g_status, L"Failed. See the message.");
     pump();
-    MessageBoxW(g_wnd, buf, L"Felonious Funnery", MB_ICONERROR | MB_OK | MB_SETFOREGROUND);
+    MessageBoxW(g_wnd, buf, L"Vinhasxyz", MB_ICONERROR | MB_OK | MB_SETFOREGROUND);
     ExitProcess(1);
 }
 
-/* Brand palette (Felonious Funnery). */
+/* Brand palette (Vinhasxyz). */
 #define C_BG     RGB(8, 9, 13)
 #define C_SURF   RGB(16, 18, 24)
 #define C_LINE   RGB(42, 47, 60)
@@ -166,6 +166,23 @@ static void fail(const wchar_t* fmt, ...) {
 #define C_PURPLE RGB(155, 92, 255)
 #define C_INK    RGB(245, 245, 247)
 #define C_MUTE   RGB(146, 152, 165)
+
+/* Launcher layout. WM_CREATE, WM_SIZE and paint_window all read these, so the
+ * status text, the log control and the box drawn around it cannot drift apart:
+ * the status ends at 86+32 = 118, the box starts at 124 and the log at 128, and
+ * both the box and the log stop short of the footer divider at client-38. */
+enum {
+    LAY_W         = 720,   /* initial window size (was 640x480)              */
+    LAY_H         = 520,
+    LAY_MARGIN    = 24,    /* text and control inset from the client edge    */
+    LAY_BOX_INSET = 22,    /* RoundRect sits 2 px outside the control inset  */
+    LAY_STATUS_Y  = 86,    /* below the header divider at y = 78             */
+    LAY_STATUS_H  = 32,    /* two wrapped lines at the 11 px status font     */
+    LAY_BOX_TOP   = 124,   /* log box top, 6 px below the status bottom      */
+    LAY_LOG_TOP   = 128,   /* log control top, 4 px inside the box           */
+    LAY_BOX_GAP   = 36,    /* log box bottom   = client height - 36          */
+    LAY_LOG_GAP   = 40     /* log control bottom = client height - 40        */
+};
 
 static HFONT   g_f_brand = NULL, g_f_brand_small = NULL, g_f_status = NULL, g_f_log = NULL;
 static HBRUSH  g_log_brush = NULL;
@@ -203,48 +220,13 @@ static void load_brand_fonts(void) {
                           CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Inter");
 }
 
-/* Hexagon emblem with the two F glyphs, drawn with GDI. */
-static void draw_emblem(HDC dc, int x, int y, int s) {
-    POINT p[6];
-    HBRUSH fb, oldb;
-    HPEN pen, oldp;
-    HFONT f, oldf;
-    p[0].x = x + s / 2;       p[0].y = y + 1;
-    p[1].x = x + s - 2;       p[1].y = y + s / 4;
-    p[2].x = x + s - 2;       p[2].y = y + 3 * s / 4;
-    p[3].x = x + s / 2;       p[3].y = y + s - 1;
-    p[4].x = x + 2;           p[4].y = y + 3 * s / 4;
-    p[5].x = x + 2;           p[5].y = y + s / 4;
-    fb = CreateSolidBrush(C_SURF);
-    pen = CreatePen(PS_SOLID, 2, C_LIME);
-    oldb = (HBRUSH)SelectObject(dc, fb);
-    oldp = (HPEN)SelectObject(dc, pen);
-    Polygon(dc, p, 6);
-    SelectObject(dc, oldb);
-    SelectObject(dc, oldp);
-    DeleteObject(fb);
-    DeleteObject(pen);
-
-    f = CreateFontW(-(s * 42 / 100), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
-                    OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                    DEFAULT_PITCH, L"Space Grotesk");
-    oldf = (HFONT)SelectObject(dc, f);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, C_LIME);
-    TextOutW(dc, x + s * 16 / 100, y + s * 24 / 100, L"F", 1);
-    SetTextColor(dc, C_PURPLE);
-    TextOutW(dc, x + s * 43 / 100, y + s * 24 / 100, L"F", 1);
-    SelectObject(dc, oldf);
-    DeleteObject(f);
-}
-
 static void paint_window(HWND h) {
     PAINTSTRUCT ps;
     HDC dc = BeginPaint(h, &ps);
     RECT rc;
     TRIVERTEX tv[2];
     GRADIENT_RECT gr;
-    int s = 38, tx = 24 + 38 + 14;
+    const int tx = LAY_MARGIN;
     SIZE word = { 0, 0 };
     HPEN pen, oldp;
     HBRUSH nullb, oldb;
@@ -258,16 +240,14 @@ static void paint_window(HWND h) {
     gr.UpperLeft = 0; gr.LowerRight = 1;
     GradientFill(dc, tv, 2, &gr, 1, GRADIENT_FILL_RECT_V);
 
-    draw_emblem(dc, 24, 22, s);
-
     SetBkMode(dc, TRANSPARENT);
     oldf = (HFONT)SelectObject(dc, g_f_brand);
     SetTextCharacterExtra(dc, 2);
-    GetTextExtentPoint32W(dc, L"FELONIOUS ", 10, &word);
+    GetTextExtentPoint32W(dc, L"VINHAS", 6, &word);
     SetTextColor(dc, C_INK);
-    TextOutW(dc, tx, 26, L"FELONIOUS", 9);
+    TextOutW(dc, tx, 26, L"VINHAS", 6);
     SetTextColor(dc, C_LIME);
-    TextOutW(dc, tx + word.cx, 26, L"FUNNERY", 7);
+    TextOutW(dc, tx + word.cx, 26, L"XYZ", 3);
     SetTextCharacterExtra(dc, 0);
     SelectObject(dc, g_f_brand_small);
     SetTextColor(dc, C_MUTE);
@@ -282,7 +262,8 @@ static void paint_window(HWND h) {
 
     nullb = (HBRUSH)GetStockObject(NULL_BRUSH);
     oldb = (HBRUSH)SelectObject(dc, nullb);
-    RoundRect(dc, 22, 112, rc.right - 22, rc.bottom - 36, 12, 12);
+    RoundRect(dc, LAY_BOX_INSET, LAY_BOX_TOP, rc.right - LAY_BOX_INSET,
+              rc.bottom - LAY_BOX_GAP, 12, 12);
     SelectObject(dc, oldb);
 
     MoveToEx(dc, 24, rc.bottom - 38, NULL);
@@ -293,7 +274,7 @@ static void paint_window(HWND h) {
     oldf = (HFONT)SelectObject(dc, g_f_brand_small);
     SetTextColor(dc, C_MUTE);
     SetTextCharacterExtra(dc, 2);
-    TextOutW(dc, 24, rc.bottom - 26, L"FELONIOUS FUNNERY", 17);
+    TextOutW(dc, 24, rc.bottom - 26, L"VINHASXYZ", 9);
     SetTextCharacterExtra(dc, 0);
     SelectObject(dc, oldf);
 
@@ -309,11 +290,14 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         GetClientRect(h, &rc);
         g_status = CreateWindowExW(0, L"STATIC", L"Starting...",
                                    WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                   24, 86, rc.right - 48, 22, h, NULL, NULL, NULL);
+                                   LAY_MARGIN, LAY_STATUS_Y, rc.right - 2 * LAY_MARGIN,
+                                   LAY_STATUS_H, h, NULL, NULL, NULL);
         g_log = CreateWindowExW(0, L"EDIT", L"",
                                 WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE |
                                 ES_READONLY | ES_AUTOVSCROLL,
-                                24, 116, rc.right - 48, rc.bottom - 156, h, NULL, NULL, NULL);
+                                LAY_MARGIN, LAY_LOG_TOP, rc.right - 2 * LAY_MARGIN,
+                                rc.bottom - LAY_LOG_GAP - LAY_LOG_TOP,
+                                h, NULL, NULL, NULL);
         if (g_f_status) SendMessageW(g_status, WM_SETFONT, (WPARAM)g_f_status, TRUE);
         if (g_f_log) SendMessageW(g_log, WM_SETFONT, (WPARAM)g_f_log, TRUE);
         return 0;
@@ -321,8 +305,12 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SIZE: {
         RECT rc;
         GetClientRect(h, &rc);
-        if (g_status) MoveWindow(g_status, 24, 86, rc.right - 48, 22, TRUE);
-        if (g_log) MoveWindow(g_log, 24, 116, rc.right - 48, rc.bottom - 156, TRUE);
+        if (g_status)
+            MoveWindow(g_status, LAY_MARGIN, LAY_STATUS_Y, rc.right - 2 * LAY_MARGIN,
+                       LAY_STATUS_H, TRUE);
+        if (g_log)
+            MoveWindow(g_log, LAY_MARGIN, LAY_LOG_TOP, rc.right - 2 * LAY_MARGIN,
+                       rc.bottom - LAY_LOG_GAP - LAY_LOG_TOP, TRUE);
         return 0;
     }
     case WM_ERASEBKGND:
@@ -361,11 +349,11 @@ static void create_window(HINSTANCE inst, const wchar_t* title) {
     wc.lpszClassName = L"RobRunAioLauncher";
     RegisterClassW(&wc);
 
-    int w = 640, h = 480;
+    int w = LAY_W, h = LAY_H;
     int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;
     int y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
     g_wnd = CreateWindowExW(WS_EX_APPWINDOW, L"RobRunAioLauncher",
-                            title ? title : L"Felonious Funnery",
+                            title ? title : L"Vinhasxyz",
                             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                             x, y, w, h, NULL, NULL, inst, NULL);
     if (g_wnd) {
@@ -1493,7 +1481,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
 
     HANDLE single = CreateMutexW(NULL, TRUE, L"Global\\RobRunAIO");
     if (single && GetLastError() == ERROR_ALREADY_EXISTS) {
-        MessageBoxW(NULL, L"Felonious Funnery is already running.", L"Felonious Funnery",
+        MessageBoxW(NULL, L"Vinhasxyz is already running.", L"Vinhasxyz",
                     MB_ICONINFORMATION | MB_OK);
         return 0;
     }
@@ -1503,11 +1491,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
         if (masq_child) {
             exe_base_name(title, _countof(title));
         } else {
-            wcsncpy_s(title, _countof(title), L"Felonious Funnery  \u2014  Rob Run", _TRUNCATE);
+            wcsncpy_s(title, _countof(title), L"Vinhasxyz  \u2014  Rob Run", _TRUNCATE);
         }
         create_window(inst, title);
     }
-    log_add(L"Felonious Funnery  \u2014  Rob Run%s", selftest ? L" (selftest)" : L"");
+    log_add(L"Vinhasxyz  \u2014  Rob Run%s", selftest ? L" (selftest)" : L"");
 
     /* Run after the payload folder exists so the findings land in aio.log. */
     check_virtualization(ignore_vbs, selftest);
