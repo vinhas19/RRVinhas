@@ -1,11 +1,12 @@
 /* rr_extras.c - Cop counter, world item collections and instant loot.
  *
  * Two read features share one publication:
- *   - the roster's cop count, derived from BattleCharacterSlotsModel and the
- *     entity map, so it counts seats that hold a character (not the entity
- *     dictionary, which also carries non-player entities). The slot table's row
- *     count travels with it as the seat capacity, which is what the free-seat
- *     count in the overlay HUD is measured against;
+ *   - the roster's cop count, derived from BattleCharacterSlotsModel (the seat
+ *     table) and the role each seated character replicates, read from the world
+ *     roster the player ESP enumerates, so it counts seats that hold a cop (not
+ *     the entity dictionary, which also carries non-player entities). The slot
+ *     table's row count travels with it as the seat capacity, which is what the
+ *     free-seat count in the overlay HUD is measured against;
  *   - a snapshot of the five WorldEntitiesModel collections with a position and
  *     a description for each.
  *
@@ -433,39 +434,111 @@ static int ex_slots(uint64_t battle, int32_t* ids, int max, int* seats) {
     return count;
 }
 
-/* Replicated role name, the same chain fill_entry() follows in rr_game.c. */
-static void ex_role_string(uint64_t character, char* out, size_t cap) {
-    out[0] = 0;
-    if (!PL(character) || cap < 2) return;
-    uint64_t data = rr_u64(character + EX_OFF_CHAR_DATA);
-    uint64_t common = PL(data) ? rr_u64(data + EX_OFF_DATA_COMMON) : 0;
-    uint64_t ref = PL(common) ? rr_u64(common + EX_OFF_COMMON_ROLE) : 0;
-    uint64_t desc = PL(ref) ? rr_u64(ref + EX_OFF_REF_VALUE) : 0;
-    uint64_t str = PL(desc) ? rr_u64(desc + EX_OFF_DESC_NAME) : 0;
-    if (PL(str)) u_string(str, out, cap);
-    out[cap - 1] = 0;
+/* ---- roles: the chain the player ESP reads ------------------------------
+ *
+ * fill_entry() in rr_game.c resolves the role of every character the ESP
+ * publishes through:
+ *     BattleCharacterModel +0x40 Data
+ *       -> BattleCharacterData +0x20 CommonData
+ *         -> BattleCharacterCommonData +0x20 Role (ReferenceData`1)
+ *           -> +0x18 description
+ *             -> +0x10 Il2CppString
+ * and the renderer colours a player blue when that string is exactly "cop"
+ * (local_is_police in rr_game.c). ex_role_walk() *is* that chain, so the cop
+ * counter and the ESP can never disagree about what a role is; the diagnostic
+ * below reuses the same walk instead of keeping a second copy that could drift.
+ */
+typedef struct {
+    uint64_t data, common, role_ref, ref_value, desc, str;
+    char     role[20];
+} EX_ROLE_TRACE;
+
+static void ex_role_walk(uint64_t character, EX_ROLE_TRACE* t) {
+    t->data = t->common = t->role_ref = t->ref_value = t->desc = t->str = 0;
+    t->role[0] = 0;
+    if (!PL(character)) return;
+    t->data      = rr_u64(character + EX_OFF_CHAR_DATA);
+    t->common    = PL(t->data)     ? rr_u64(t->data + EX_OFF_DATA_COMMON) : 0;
+    t->role_ref  = PL(t->common)   ? rr_u64(t->common + EX_OFF_COMMON_ROLE) : 0;
+    t->ref_value = PL(t->role_ref) ? rr_u64(t->role_ref + EX_OFF_REF_VALUE) : 0;
+    t->desc      = t->ref_value;              /* ReferenceData`1 -> description */
+    t->str       = PL(t->desc)     ? rr_u64(t->desc + EX_OFF_DESC_NAME) : 0;
+    if (PL(t->str)) u_string(t->str, t->role, sizeof(t->role));
+    t->role[sizeof(t->role) - 1] = 0;
 }
+
 typedef struct { int32_t id; int cop; } EX_ROLE;
 
-/* Resolve the roles of the seated entity ids only: the entity map also holds
- * vehicles and other non-character entities, and their keys never match. */
-static int ex_roles(uint64_t battle, const int32_t* ids, int id_count,
-                    EX_ROLE* out, int cap) {
-    uint64_t entities = rr_u64(battle + EX_OFF_BATTLE_ENTITIES);
-    if (!u_is(entities, "BattleEntitiesModel")) return 0;
+static int ex_id_wanted(const int32_t* ids, int id_count, int32_t id) {
+    for (int i = 0; i < id_count; ++i) if (ids[i] == id) return 1;
+    return 0;
+}
+
+/* One entry per seated id; a second answer for the same id is ignored, so the
+ * roster and the entity map can be merged without double counting. */
+static int ex_role_add(EX_ROLE* out, int count, int cap, int32_t id, const char* role) {
+    for (int i = 0; i < count; ++i) if (out[i].id == id) return count;
+    if (count >= cap) return count;
+    out[count].id = id;
+    out[count].cop = strcmp(role, "cop") == 0;   /* rr_game.c police test */
+    return count + 1;
+}
+
+/* The world roster: WorldEntitiesModel._battleCharacters, the
+ * Dictionary<int, BattleCharacterModel> the ESP enumerates every frame. The id
+ * is taken from the character's own Id field -- the value the published
+ * snapshot carries and the seat table references -- not from the dictionary
+ * key, so a roster keyed some other way still joins. A character whose role
+ * string is empty is a template or an unspawned copy; fill_entry() drops those
+ * too (it publishes nothing rather than a blank role). */
+static int ex_roster_roles(uint64_t world, const int32_t* ids, int id_count,
+                           EX_ROLE* out, int cap) {
+    if (!u_is(world, "WorldEntitiesModel")) return 0;
     EX_DICT dict;
-    if (!ex_dict(rr_u64(entities + EX_OFF_BATTLE_MODELS), &dict)) return 0;
-    int n = ex_dict_rows(&dict, EX_MAX_ENTITY_DICT);
-    if (n <= 0) return 0;
+    if (!ex_dict(rr_u64(world + EX_OFF_WE_BATTLE_CHARS), &dict)) return 0;
+    int n = ex_dict_rows(&dict, EX_MAX_WORLD_DICT);
     int count = 0;
+    for (int i = 0; i < n && count < cap; ++i) {
+        const uint8_t* row = g_rows + (size_t)i * EX_OFF_DICT_STRIDE;
+        int32_t hash = 0;
+        memcpy(&hash, row + EX_OFF_DICT_HASH, 4);
+        if (hash < 0) continue;                       /* freed entry          */
+        uint64_t character = ex_row_value(row);
+        if (!u_is(character, "BattleCharacterModel")) continue;
+        int32_t id = -1;
+        if (!rr_read(character + EX_OFF_CHAR_ID, &id, sizeof(id))) continue;
+        if (!ex_id_wanted(ids, id_count, id)) continue;
+        EX_ROLE_TRACE t;
+        ex_role_walk(character, &t);
+        if (!t.role[0]) continue;
+        count = ex_role_add(out, count, cap, id, t.role);
+    }
+    return count;
+}
+
+/* Fallback: BattleModel +0x90 BattleEntitiesModel -> +0x50 _models
+ * (Dictionary<int, IEntityModel>) -> BattleCharacterEntityModel +0x28 server
+ * character. Only used for seats the roster did not answer: that +0x28 hop is
+ * from the 17/11 table and is the one link nothing else in the overlay reads,
+ * while the roster above is the table the ESP proves every frame. `count` is
+ * the number of roles already resolved, which the new answers are appended to.
+ */
+static int ex_entity_roles(uint64_t battle, const int32_t* ids, int id_count,
+                           EX_ROLE* out, int count, int cap) {
+    uint64_t entities = rr_u64(battle + EX_OFF_BATTLE_ENTITIES);
+    if (!u_is(entities, "BattleEntitiesModel")) return count;
+    EX_DICT dict;
+    if (!ex_dict(rr_u64(entities + EX_OFF_BATTLE_MODELS), &dict)) return count;
+    int n = ex_dict_rows(&dict, EX_MAX_ENTITY_DICT);
+    if (n <= 0) return count;
     for (int i = 0; i < n && count < cap; ++i) {
         const uint8_t* row = g_rows + (size_t)i * EX_OFF_DICT_STRIDE;
         int32_t key = ex_row_id(row);
         if (key < 0) continue;
-        int wanted = 0;
-        for (int j = 0; j < id_count; ++j)
-            if (ids[j] == key) { wanted = 1; break; }
-        if (!wanted) continue;
+        if (!ex_id_wanted(ids, id_count, key)) continue;
+        int known = 0;
+        for (int j = 0; j < count; ++j) if (out[j].id == key) known = 1;
+        if (known) continue;
         uint64_t entity = ex_row_value(row);
         if (!u_is(entity, "BattleCharacterEntityModel")) continue;
         uint64_t character = rr_u64(entity + EX_OFF_ENTITY_SERVER);
@@ -473,16 +546,28 @@ static int ex_roles(uint64_t battle, const int32_t* ids, int id_count,
         int32_t character_id = -1;
         if (!rr_read(character + EX_OFF_CHAR_ID, &character_id, sizeof(character_id)) ||
             character_id != key) continue;
-        char role[20];
-        ex_role_string(character, role, sizeof(role));
-        out[count].id = key;
-        out[count].cop = strcmp(role, "cop") == 0;   /* rr_game.c police test */
-        ++count;
+        EX_ROLE_TRACE t;
+        ex_role_walk(character, &t);
+        count = ex_role_add(out, count, cap, key, t.role);
     }
     return count;
 }
 
-static void ex_cop_scan(uint64_t battle, int* cops, int* slots, int* seats) {
+/* Roles of the seated entity ids. The roster answers first because it is the
+ * path the ESP already reads; the entity map then covers a seat whose character
+ * the roster has not published yet (the frame a player spawns). A seat neither
+ * path resolves is not a cop, which is the same answer as "not seated".
+ */
+static int ex_roles(uint64_t battle, uint64_t world, const int32_t* ids, int id_count,
+                    EX_ROLE* out, int cap) {
+    if (!ids || !out || id_count <= 0 || cap <= 0) return 0;
+    int count = ex_roster_roles(world, ids, id_count, out, cap);
+    if (count < id_count && PL(battle))
+        count = ex_entity_roles(battle, ids, id_count, out, count, cap);
+    return count;
+}
+
+static void ex_cop_scan(uint64_t battle, uint64_t world, int* cops, int* slots, int* seats) {
     *cops = 0;
     *slots = 0;
     *seats = 0;
@@ -491,13 +576,159 @@ static void ex_cop_scan(uint64_t battle, int* cops, int* slots, int* seats) {
     if (n <= 0) return;
     *slots = n > EX_MAX_SLOTS ? EX_MAX_SLOTS : n;
     static EX_ROLE roles[EX_MAX_SLOTS];
-    int rn = ex_roles(battle, ids, *slots, roles, EX_MAX_SLOTS);
+    int rn = ex_roles(battle, world, ids, *slots, roles, EX_MAX_SLOTS);
     for (int i = 0; i < *slots; ++i)
         for (int j = 0; j < rn; ++j)
             if (roles[j].id == ids[i]) {
                 if (roles[j].cop) ++*cops;
                 break;
             }
+}
+
+/* ---- diagnostic: the role chain, one status.log block per second --------
+ *
+ * The seat table can read perfectly and still count zero cops: the failure is
+ * then the join from a seat's EntityId to a character whose replicated role
+ * says "cop". With debug_slots on, the first three occupied seats are followed
+ * through both joins -- the world roster the ESP reads and the entity-map chain
+ * (BattleEntitiesModel._models -> +0x28 server character) -- and every hop is
+ * printed with its class name plus the raw UTF-16 of the final string. The link
+ * that is empty or class-checks out names itself here.
+ */
+static void ex_role_line(FILE* f, int32_t eid, const char* via, uint64_t character) {
+    EX_ROLE_TRACE t;
+    ex_role_walk(character, &t);
+    char char_cls[64], desc_cls[64], str_cls[64];
+    ex_cls_name(character, char_cls, sizeof(char_cls));
+    ex_cls_name(t.desc, desc_cls, sizeof(desc_cls));
+    ex_cls_name(t.str, str_cls, sizeof(str_cls));
+    /* The UTF-16 the runtime holds, independently of the decoder: a role that
+     * decodes to something unexpected still shows its code units. */
+    int len = 0;
+    uint16_t u16[16];
+    memset(u16, 0, sizeof(u16));
+    if (PL(t.str) && rr_read(t.str + U_STR_LEN, &len, sizeof(len)) &&
+        len > 0 && len <= (int)(sizeof(u16) / sizeof(u16[0])))
+        if (!rr_read(t.str + U_STR_CHARS, u16, (size_t)len * 2)) len = 0;
+    char units[16 * 6 + 1];
+    units[0] = 0;
+    for (int i = 0; i < len; ++i) {
+        char one[8];
+        snprintf(one, sizeof(one), " %04X", u16[i]);
+        strncat(units, one, sizeof(units) - strlen(units) - 1);
+    }
+    fprintf(f, "roles_debug: eid=%d via=%s char=0x%llX char_cls=%s data=0x%llX"
+               " common=0x%llX role_ref=0x%llX ref_value=0x%llX desc_cls=%s"
+               " str=0x%llX str_cls=%s u16len=%d u16=%s role=\"%s\" cop=%d\n",
+            eid, via, (unsigned long long)character, char_cls,
+            (unsigned long long)t.data, (unsigned long long)t.common,
+            (unsigned long long)t.role_ref, (unsigned long long)t.ref_value, desc_cls,
+            (unsigned long long)t.str, str_cls, len, units, t.role,
+            strcmp(t.role, "cop") == 0);
+}
+
+static void ex_roles_debug(uint64_t battle, uint64_t world) {
+    static DWORD last;                 /* worker thread only */
+    DWORD now = GetTickCount();
+    if (last && now - last < 1000) return;
+    last = now;
+
+    static int32_t ids[EX_MAX_SLOTS];
+    int seats = 0;
+    int occupied = ex_slots(battle, ids, EX_MAX_SLOTS, &seats);
+
+    /* Every anchor both joins walk, printed raw: a missing class check can then
+     * be told from an empty table. */
+    uint64_t entities = PL(battle) ? rr_u64(battle + EX_OFF_BATTLE_ENTITIES) : 0;
+    int is_entities = u_is(entities, "BattleEntitiesModel");
+    uint64_t models = is_entities ? rr_u64(entities + EX_OFF_BATTLE_MODELS) : 0;
+    int mcnt = 0, mstride = 0;
+    uint64_t mentries = 0;
+    if (PL(models)) u_dict(models, &mcnt, &mentries, &mstride);
+    uint64_t roster_dict = PL(world) ? rr_u64(world + EX_OFF_WE_BATTLE_CHARS) : 0;
+    int rcnt = 0, rstride = 0;
+    uint64_t rentries = 0;
+    if (PL(roster_dict)) u_dict(roster_dict, &rcnt, &rentries, &rstride);
+
+    FILE* f = ex_status_open();
+    if (!f) return;
+    fprintf(f, "roles_debug: battle=0x%llX world=0x%llX is_world=%d"
+               " roster_dict=0x%llX roster_cnt=%d roster_stride=%d"
+               " entities=0x%llX is_entities=%d models=0x%llX models_cnt=%d"
+               " models_stride=%d seats=%d occupied=%d\n",
+            (unsigned long long)battle, (unsigned long long)world,
+            u_is(world, "WorldEntitiesModel"), (unsigned long long)roster_dict,
+            rcnt, rstride, (unsigned long long)entities, is_entities,
+            (unsigned long long)models, mcnt, mstride, seats, occupied);
+
+    enum { EX_DBG_SEATS = 3 };
+    int want = occupied < EX_DBG_SEATS ? occupied : EX_DBG_SEATS;
+    if (want <= 0) { fclose(f); return; }
+
+    struct { int32_t id, server_id, roster_id; uint64_t entity, server, roster; }
+        rows[EX_DBG_SEATS];
+    memset(rows, 0, sizeof(rows));
+    for (int k = 0; k < want; ++k) { rows[k].id = ids[k]; rows[k].server_id = -1;
+                                     rows[k].roster_id = -1; }
+
+    if (PL(mentries) && mcnt > 0) {
+        int mn = mcnt < EX_MAX_ENTITY_DICT ? mcnt : EX_MAX_ENTITY_DICT;
+        if (rr_read(mentries, g_rows, (size_t)mn * EX_OFF_DICT_STRIDE)) {
+            for (int i = 0; i < mn; ++i) {
+                const uint8_t* row = g_rows + (size_t)i * EX_OFF_DICT_STRIDE;
+                int32_t key = ex_row_id(row);
+                for (int k = 0; k < want; ++k) {
+                    if (rows[k].id != key || rows[k].entity) continue;
+                    rows[k].entity = ex_row_value(row);
+                    rows[k].server = PL(rows[k].entity)
+                        ? rr_u64(rows[k].entity + EX_OFF_ENTITY_SERVER) : 0;
+                    if (!PL(rows[k].server) ||
+                        !rr_read(rows[k].server + EX_OFF_CHAR_ID, &rows[k].server_id, 4))
+                        rows[k].server_id = -1;
+                }
+            }
+        }
+    }
+    if (PL(rentries) && rcnt > 0) {
+        int rn = rcnt < EX_MAX_WORLD_DICT ? rcnt : EX_MAX_WORLD_DICT;
+        if (rr_read(rentries, g_rows, (size_t)rn * EX_OFF_DICT_STRIDE)) {
+            for (int i = 0; i < rn; ++i) {
+                const uint8_t* row = g_rows + (size_t)i * EX_OFF_DICT_STRIDE;
+                int32_t hash = 0;
+                memcpy(&hash, row + EX_OFF_DICT_HASH, 4);
+                if (hash < 0) continue;
+                uint64_t character = ex_row_value(row);
+                int32_t cid = -1;
+                if (!PL(character) || !rr_read(character + EX_OFF_CHAR_ID, &cid, sizeof(cid)))
+                    continue;
+                for (int k = 0; k < want; ++k) {
+                    if (rows[k].id != cid || rows[k].roster) continue;
+                    rows[k].roster = character;
+                    rows[k].roster_id = cid;
+                }
+            }
+        }
+    }
+
+    for (int k = 0; k < want; ++k) {
+        char entity_cls[64], server_cls[64], roster_cls[64];
+        ex_cls_name(rows[k].entity, entity_cls, sizeof(entity_cls));
+        ex_cls_name(rows[k].server, server_cls, sizeof(server_cls));
+        ex_cls_name(rows[k].roster, roster_cls, sizeof(roster_cls));
+        fprintf(f, "roles_debug: eid=%d entity=0x%llX is_entity=%d entity_cls=%s"
+                   " server=0x%llX is_server=%d server_cls=%s server_id=%d"
+                   " roster=0x%llX is_roster=%d roster_cls=%s roster_id=%d\n",
+                rows[k].id, (unsigned long long)rows[k].entity,
+                u_is(rows[k].entity, "BattleCharacterEntityModel"), entity_cls,
+                (unsigned long long)rows[k].server,
+                u_is(rows[k].server, "BattleCharacterModel"), server_cls,
+                rows[k].server_id, (unsigned long long)rows[k].roster,
+                u_is(rows[k].roster, "BattleCharacterModel"), roster_cls,
+                rows[k].roster_id);
+        ex_role_line(f, rows[k].id, "server", rows[k].server);
+        ex_role_line(f, rows[k].id, "roster", rows[k].roster);
+    }
+    fclose(f);
 }
 
 /* ---- --probe: one-shot seat-table dump ---------------------------------
@@ -509,7 +740,7 @@ static void ex_cop_scan(uint64_t battle, int* cops, int* slots, int* seats) {
  * `_slots` out differently names itself here instead of publishing a count of
  * zero, which is what a seat table with no cops looks like.
  */
-int extras_slots_probe(uint64_t battle_model) {
+int extras_slots_probe(uint64_t battle_model, uint64_t world) {
     FILE* f = ex_status_open();
     if (!f) return -1;
     int is_model = u_is(battle_model, "BattleModel");
@@ -574,13 +805,14 @@ int extras_slots_probe(uint64_t battle_model) {
     }
 
     int cops = 0, slots = 0, seats = 0;
-    ex_cop_scan(battle_model, &cops, &slots, &seats);
+    ex_cop_scan(battle_model, world, &cops, &slots, &seats);
     fprintf(f, "slots_layout: cops=%d occupied=%d seats=%d free=%d\n",
             cops, slots, seats, seats > slots ? seats - slots : 0);
     fclose(f);
-    /* Also emit the production line the overlay would append (its 1 s throttle is
-     * per process, so a one-shot dump always writes exactly one). */
+    /* Also emit the production lines the overlay would append (their 1 s
+     * throttle is per process, so a one-shot dump writes exactly one block). */
     ex_slots_debug(battle_model);
+    ex_roles_debug(battle_model, world);
     return slots;
 }
 /* ---- Feature 2: world items -------------------------------------------- */
@@ -692,9 +924,14 @@ void extras_refresh(uint64_t battle, uint64_t world, int force) {
     DWORD now = GetTickCount();
     if (!force && g_have_stamp && now - g_stamp < 400) return;
 
-    /* Diagnostic hook: runs before the early return below, so a count of zero can
-     * be read as "the chain is broken" or "no battle" instead of silently. */
-    if (cfg->debug_slots) ex_slots_debug(battle);
+    /* Diagnostic hooks: run before the early return below, so a count of zero can
+     * be read as "the chain is broken" or "no battle" instead of silently. The
+     * role dump answers the next question -- the seat table read fine, so is the
+     * failing link the join from a seat id to a character's role string? */
+    if (cfg->debug_slots) {
+        ex_slots_debug(battle);
+        ex_roles_debug(battle, world);
+    }
 
     int want_cops  = cfg->show_cop_counter != 0;
     int want_items = cfg->show_world_items != 0;
@@ -717,7 +954,7 @@ void extras_refresh(uint64_t battle, uint64_t world, int force) {
     static EXTRA_WORLD_ITEM staged[EXTRA_MAX_WORLD_ITEMS];
     int items = 0;
     int have_world = PL(world) && u_is(world, "WorldEntitiesModel");
-    if (want_cops && PL(battle)) ex_cop_scan(battle, &cops, &slots, &seats);
+    if (want_cops && PL(battle)) ex_cop_scan(battle, world, &cops, &slots, &seats);
     if (have_world && (want_items || want_hide)) {
         if (want_items) items = ex_world_items(world, staged, items, EXTRA_MAX_WORLD_ITEMS);
         if (want_hide)  items = ex_hide_items(world, staged, items, EXTRA_MAX_WORLD_ITEMS);

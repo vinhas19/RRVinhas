@@ -142,6 +142,33 @@ the three seat classes, and finally `cops=`, `occupied=`, `seats=` and `free=`.
 It ends with the production `slots_debug:` line, so `--probe` alone diagnoses the
 counter without leaving `debug_slots` on for a session.
 
+The count needs a second join: a seat's `EntityId` has to reach a character whose
+replicated role says `cop`. That role is read from the place the player ESP reads
+it -- `WorldEntitiesModel._battleCharacters` (`0x18`), the
+`Dictionary<int, BattleCharacterModel>` the snapshot fill enumerates -- through
+the chain `fill_entry()` uses: `+0x40 Data` -> `+0x20 CommonData` -> `+0x20 Role`
+(``ReferenceData`1``) -> `+0x18` description -> `+0x10` `Il2CppString`, and a
+character counts when that string is exactly `cop`, the same test the renderer
+uses to colour a player blue. The id comes from the character's own `+0x38 Id`,
+so the roster key never has to match; a character with an empty role is a
+template or an unspawned copy, which `fill_entry()` drops as well. The entity map
+(`BattleModel +0x90` -> `+0x50 _models` -> `BattleCharacterEntityModel +0x28`
+server character) is only a fallback for seats the roster has not published yet.
+Its `+0x28` is the one link nothing else in the overlay reads, which makes it the
+first suspect when the roster path is silent.
+
+`debug_slots` also appends `roles_debug:` lines for the first three occupied
+seats. The header prints `battle`, `world`, `is_world`, the roster dictionary
+(`roster_dict`, `roster_cnt`, `roster_stride`), the entity map (`entities`,
+`is_entities`, `models`, `models_cnt`, `models_stride`) and `seats`/`occupied`
+(`occupied=-1` means the seat table itself could not be read). Each seat then
+gets a links line -- `entity`/`is_entity`/`entity_cls`, `server`/`is_server`/
+`server_cls`/`server_id`, `roster`/`is_roster`/`roster_cls`/`roster_id` -- and
+one chain line per join (`via=server`, `via=roster`) with every hop address, the
+class name of the description and of the string, the raw UTF-16 code units
+(`u16=`) and the decoded `role`/`cop`. The hop that reads as 0, or whose class
+name does not match, is the broken link. `--probe` prints the same block once.
+
 Instant loot is the module's only writer. While the World tab switch is on, a
 250 ms loop (`extras_insta_tick()`) zeroes the cell-border, shine and icon
 reveal durations of the container being viewed, through the existing

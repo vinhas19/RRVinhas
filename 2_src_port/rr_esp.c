@@ -1112,6 +1112,15 @@ static int run_selftest(void) {
           EX_OFF_SLOT_DESC == 0x18u && EX_OFF_SLOT_ENTITY_ID == 0x20u &&
           EX_OFF_PRIM_VALUE == 0x18u,
           "seat table key/value are the reference pair rr_hiding.h reads");
+    /* The role chain is fill_entry()'s (the chain the ESP colours players by):
+     * BattleCharacterModel +0x40 -> +0x20 -> +0x20 -> +0x18 -> +0x10, with the
+     * character id at +0x38, and the roster it is read from is
+     * WorldEntitiesModel._battleCharacters at +0x18. */
+    check(EX_OFF_CHAR_DATA == 0x40u && EX_OFF_DATA_COMMON == 0x20u &&
+          EX_OFF_COMMON_ROLE == 0x20u && EX_OFF_REF_VALUE == 0x18u &&
+          EX_OFF_DESC_NAME == 0x10u && EX_OFF_CHAR_ID == 0x38u &&
+          EX_OFF_WE_BATTLE_CHARS == 0x18u,
+          "role chain matches fill_entry() and the roster the ESP reads");
     {
         static EXTRA_WORLD_ITEM extra_items[8];
         extras_reset();
@@ -1131,7 +1140,7 @@ static int run_selftest(void) {
         live->debug_slots = 1;
         extras_reset();
         extras_refresh(0, 0, 1);
-        int found = 0;
+        int found = 0, found_roles = 0;
         char dpath[MAX_PATH];
         DWORD dlen = GetModuleFileNameA(NULL, dpath, MAX_PATH);
         char* dslash = dlen ? strrchr(dpath, '\\') : NULL;
@@ -1149,6 +1158,7 @@ static int run_selftest(void) {
                         size_t got = fread(tail, 1, sizeof(tail) - 1, df);
                         tail[got] = 0;
                         found = strstr(tail, "slots_debug: battle=0x0 model=0x0 is_slots=0") != NULL;
+                        found_roles = strstr(tail, "roles_debug: battle=0x0 world=0x0 is_world=0") != NULL;
                     }
                 }
                 fclose(df);
@@ -1156,13 +1166,14 @@ static int run_selftest(void) {
         }
         live->debug_slots = saved;
         check(found, "slots debug writes a status.log line with no battle");
+        check(found_roles, "roles debug writes a status.log line with no battle");
     }
 
     /* 2b1b. the --probe layout dump: an unknown battle must be refused instead of
      * reading through a null anchor, and the refusal has to land in status.log so
      * a probe run without a lobby still says why it printed nothing. */
     {
-        check(extras_slots_probe(0) == -1, "slots layout dump refuses an unknown battle");
+        check(extras_slots_probe(0, 0) == -1, "slots layout dump refuses an unknown battle");
         int found = 0;
         char dpath[MAX_PATH];
         DWORD dlen = GetModuleFileNameA(NULL, dpath, MAX_PATH);
@@ -1406,10 +1417,11 @@ static int run_probe(void) {
            game_prim_offset(), game_dict_offset());
 
     /* Read-only seat-table dump for the cop counter: the entries of the first
-     * rows, the class each candidate offset points at, and the counts the
-     * production chain resolves. Written to status.log beside this exe. */
+     * rows, the class each candidate offset points at, the role chain of the
+     * first three occupied seats, and the counts the production chain resolves.
+     * Written to status.log beside this exe. */
     out("[probe] slots: occupied=%d (layout in status.log)\n",
-        extras_slots_probe(game_battle_model()));
+        extras_slots_probe(game_battle_model(), game_world_addr()));
 
     static RR_PLAYER players[RR_MAX_PLAYERS];
     RR_CAMERA cam;

@@ -57,6 +57,10 @@ extern "C" {
 /* --- WorldEntitiesModel collections -------------------------------------
  * src: 17/11/2026 dump; identical to the generated dump-20261112 values used
  * by cache_world_markers() in rr_game.c. */
+/* The roster the player ESP enumerates: Dictionary<int, BattleCharacterModel>.
+ * ex_roles() reads a seat's role from here, because this is the table the ESP
+ * already resolves and colours players by. */
+#define EX_OFF_WE_BATTLE_CHARS      RR_OFF_WEM_BATTLE_CHARS   /* 0x018 */
 #define EX_OFF_WE_CONTAINERS        RR_OFF_WEM_CONTAINERS     /* 0x020 */
 #define EX_OFF_WE_LOOTS             RR_OFF_WEM_DROPPED_LOOT   /* 0x038 */
 #define EX_OFF_WE_VEHICLE_LOOTS     RR_OFF_WEM_VEHICLE_LOOT   /* 0x040 */
@@ -175,11 +179,11 @@ int extras_insta_tick(uint64_t battle, uint64_t updater);
 void extras_reset(void);
 
 /* Read-only seat-table dump for --probe. Walks the same chain ex_slots() uses
- * and appends the raw entries, the class name at every candidate offset and the
- * resolved counts to status.log beside the exe. Returns the number of occupied
- * seats, or -1 when the table cannot be read. Makes no writes and publishes
- * nothing. */
-int extras_slots_probe(uint64_t battle_model);
+ * and appends the raw entries, the class name at every candidate offset, the
+ * role chain of the first three occupied seats and the resolved counts to
+ * status.log beside the exe. Returns the number of occupied seats, or -1 when
+ * the table cannot be read. Makes no writes and publishes nothing. */
+int extras_slots_probe(uint64_t battle_model, uint64_t world);
 
 #ifdef __cplusplus
 }
