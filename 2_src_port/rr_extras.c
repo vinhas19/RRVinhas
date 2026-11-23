@@ -220,6 +220,15 @@ static uint64_t ex_row_value(const uint8_t* row) {
     return value;
 }
 
+/* Reference keyed row (Dictionary<TRef, TRef>): the key is 8 bytes wide at the
+ * offset an int32 key occupies, so it must be read whole and class-checked
+ * instead of through ex_row_id(). _slots is the only such table here. */
+static uint64_t ex_row_ref(const uint8_t* row) {
+    uint64_t key = 0;
+    memcpy(&key, row + EX_OFF_SLOT_KEY, 8);
+    return key;
+}
+
 /* ---- Feature 1: cop counter -------------------------------------------- */
 
 /* ---- diagnostic: the slot chain, one status.log line per second ----------
@@ -234,6 +243,19 @@ static uint64_t ex_row_value(const uint8_t* row) {
  * Worker thread only, like the rest of the chain; the throttle is one line per
  * second so a several-minute session stays readable.
  */
+/* status.log beside the exe: the debug_slots line and the --probe layout dump
+ * both append to it. Returns NULL when the module path cannot be built or the
+ * file cannot be opened, and the caller then writes nothing. */
+static FILE* ex_status_open(void) {
+    char path[MAX_PATH];
+    DWORD length = GetModuleFileNameA(NULL, path, MAX_PATH);
+    char* slash = length ? strrchr(path, '\\') : NULL;
+    if (!slash) return NULL;
+    *(slash + 1) = 0;
+    strncat(path, "status.log", MAX_PATH - strlen(path) - 1);
+    return fopen(path, "a");
+}
+
 static void ex_cls_name(uint64_t obj, char* out, size_t cap) {
     uint64_t klass = PL(obj) ? u_klass(obj) : 0;
     if (!klass || !u_class_name(klass, out, cap)) snprintf(out, cap, "?");
@@ -260,8 +282,10 @@ static void ex_slots_debug(uint64_t battle) {
     }
 
     /* First row whose hash is not negative: row 0 can be a freed slot, which
-     * carries neither a key nor a value. */
-    int hash = 0, key = 0, row = -1, is_slot = 0, is_data = 0, eid = -1;
+     * carries neither a key nor a value. _slots is keyed by a reference, so the
+     * key is read whole (8 bytes) and class-checked -- first_key is only its low
+     * half and must not be mistaken for an entity id. */
+    int hash = 0, key = 0, row = -1, is_slot = 0, is_data = 0, key_is_desc = 0, eid = -1;
     uint64_t key_q = 0, slot = 0, data = 0, ref = 0, desc = 0;
     if (PL(entries)) {
         enum { EX_DBG_ROWS = 64 };
@@ -273,19 +297,38 @@ static void ex_slots_debug(uint64_t battle) {
                 memcpy(&hash, r + EX_OFF_DICT_HASH, 4);
                 if (hash < 0) continue;
                 row = i;
-                memcpy(&key, r + EX_OFF_DICT_KEY, 4);
-                memcpy(&key_q, r + EX_OFF_DICT_KEY, 8);
-                memcpy(&slot, r + EX_OFF_DICT_VALUE, 8);
+                key_q = ex_row_ref(r);
+                key = (int32_t)(key_q & 0xFFFFFFFFu);
+                slot = ex_row_value(r);
                 break;
             }
         }
     }
-    /* row + 0x10 -> slot model; +0x10 -> _data_1; +0x20 -> EntityId reference,
-     * whose boxed int sits at +0x18 (same hops as ex_slots() / rr_hiding.h). */
-    if (PL(slot)) {
-        is_slot = u_is(slot, "BattleCharacterSlotModel");
-        data = rr_u64(slot + EX_OFF_SLOT_DATA);
-        desc = rr_u64(slot + EX_OFF_SLOT_DESC);
+    /* The seat table stores a BattleCharacterSlotDescription and a
+     * BattleCharacterSlotModel in some order; the pairing is proven by the slot
+     * model's own Description back-reference (the identity ex_slots() requires).
+     * pair=0 is the order the SDK dump declares (description key first), pair=1
+     * the reverse, -1 no accepted pairing. row + 0x10 of the model is _data_1 and
+     * _data_1 + 0x20 is the EntityId reference whose boxed int sits at +0x18 --
+     * the same hops as ex_slots() and rr_hiding.h. */
+    int pair = -1;
+    uint64_t pair_desc = 0, model_obj = 0;
+    if (PL(key_q) && PL(slot)) {
+        if (u_is(key_q, "BattleCharacterSlotDescription") &&
+            u_is(slot, "BattleCharacterSlotModel") &&
+            rr_u64(slot + EX_OFF_SLOT_DESC) == key_q) {
+            pair = 0; pair_desc = key_q; model_obj = slot;
+        } else if (u_is(slot, "BattleCharacterSlotDescription") &&
+                   u_is(key_q, "BattleCharacterSlotModel") &&
+                   rr_u64(key_q + EX_OFF_SLOT_DESC) == slot) {
+            pair = 1; pair_desc = slot; model_obj = key_q;
+        }
+    }
+    key_is_desc = u_is(key_q, "BattleCharacterSlotDescription");
+    is_slot = u_is(slot, "BattleCharacterSlotModel");
+    if (PL(model_obj)) {
+        data = rr_u64(model_obj + EX_OFF_SLOT_DATA);
+        desc = rr_u64(model_obj + EX_OFF_SLOT_DESC);
     }
     if (PL(data)) {
         is_data = u_is(data, "BattleCharacterSlotData");
@@ -293,41 +336,48 @@ static void ex_slots_debug(uint64_t battle) {
     }
     if (PL(ref)) rr_read(ref + EX_OFF_PRIM_VALUE, &eid, sizeof(eid));
 
-    char battle_cls[64], model_cls[64], slot_cls[64], data_cls[64];
+    char battle_cls[64], model_cls[64], key_cls[64], slot_cls[64], data_cls[64];
     ex_cls_name(battle, battle_cls, sizeof(battle_cls));
     ex_cls_name(model, model_cls, sizeof(model_cls));
+    ex_cls_name(key_q, key_cls, sizeof(key_cls));
     ex_cls_name(slot, slot_cls, sizeof(slot_cls));
     ex_cls_name(data, data_cls, sizeof(data_cls));
 
-    char path[MAX_PATH];
-    DWORD length = GetModuleFileNameA(NULL, path, MAX_PATH);
-    char* slash = length ? strrchr(path, '\\') : NULL;
-    if (!slash) return;
-    *(slash + 1) = 0;
-    strncat(path, "status.log", MAX_PATH - strlen(path) - 1);
-    FILE* f = fopen(path, "a");
+    FILE* f = ex_status_open();
     if (!f) return;
     /* The fields the diagnostic asks for come first, in order; the raw addresses
-     * and class names that follow say which hop produced them. key_q is the full
-     * 8 bytes behind first_key: a slot table keyed by a reference shows a heap
-     * pointer there instead of a small entity id. */
+     * and class names that follow say which hop produced them. _slots is keyed by
+     * a BattleCharacterSlotDescription reference and valued by a
+     * BattleCharacterSlotModel reference, so first_key_is_desc=1 and
+     * desc_is_key=1 are the identities the reader requires; first_key is only the
+     * low half of that key and is never compared with an entity id. */
     fprintf(f, "slots_debug: battle=0x%llX model=0x%llX is_slots=%d dict=0x%llX used=%d"
                " first_key=%d first_eid=%d first_is_slot=%d first_is_data=%d"
-               " battle_cls=%s model_cls=%s slot_cls=%s data_cls=%s"
+               " first_key_is_desc=%d pair=%d"
+               " battle_cls=%s model_cls=%s key_cls=%s slot_cls=%s data_cls=%s"
                " row=%d hash=%d key_q=0x%llX slot=0x%llX data=0x%llX ref=0x%llX"
                " desc=0x%llX desc_is_key=%d entries=0x%llX cnt=%d stride=%d\n",
             (unsigned long long)battle, (unsigned long long)model, is_slots,
-            (unsigned long long)dict, used, key, eid, is_slot, is_data,
-            battle_cls, model_cls, slot_cls, data_cls,
+            (unsigned long long)dict, used, key, eid, is_slot, is_data, key_is_desc,
+            pair,
+            battle_cls, model_cls, key_cls, slot_cls, data_cls,
             row, hash, (unsigned long long)key_q, (unsigned long long)slot,
             (unsigned long long)data, (unsigned long long)ref,
-            (unsigned long long)desc, desc != 0 && desc == key_q,
+            (unsigned long long)desc, desc != 0 && desc == pair_desc,
             (unsigned long long)entries, cnt, stride);
     fclose(f);
 }
 
-/* Slot entity ids. Both id sources (the dictionary key and the slot's own
- * EntityId) must agree, the same rule cache_roster_identity() applies.
+/* Slot entity ids, following the chain rr_hiding.h uses for the same table.
+ *
+ * _slots is Dictionary<BattleCharacterSlotDescription, BattleCharacterSlotModel>:
+ * both halves of an entry are object references, so the key at +0x08 is the
+ * slot's *description*, not its entity id. The id sits two hops further down, in
+ * BattleCharacterSlotData.EntityId -- an IPrimitiveData<int> whose boxed int is
+ * at +0x18. Comparing the dictionary key against the id, which this function
+ * used to do, can never hold for a reference key: every row failed and a full
+ * lobby published zero occupied seats. The pair is proven by identity instead
+ * (the slot's own Description must be the key), exactly as rr_hiding.h does.
  *
  * `seats` (optional) reports the size of the slot table: `_slots` holds one row
  * per seat the battle created, and a seat without a player still has its row
@@ -346,18 +396,37 @@ static int ex_slots(uint64_t battle, int32_t* ids, int max, int* seats) {
     int n = ex_dict_rows(&dict, EX_MAX_SLOTS);
     if (n <= 0) return 0;
     int count = 0;
-    for (int i = 0; i < n; ++i) {
+    for (int i = 0; i < n && count < max; ++i) {
         const uint8_t* row = g_rows + (size_t)i * EX_OFF_DICT_STRIDE;
-        int32_t key = ex_row_id(row);
-        if (key < 0) continue;
-        uint64_t slot = ex_row_value(row);
-        if (!u_is(slot, "BattleCharacterSlotModel")) continue;
+        int32_t hash = 0;
+        memcpy(&hash, row + EX_OFF_DICT_HASH, 4);
+        if (hash < 0) continue;                       /* freed entry          */
+        /* The dump declares Dictionary<BattleCharacterSlotDescription,
+         * BattleCharacterSlotModel>, so the key at +0x08 is the description and
+         * the value at +0x10 the slot model. Do not trust the order alone: the
+         * slot model carries its own Description back-reference, so the pairing
+         * is accepted only when it holds. The reverse order is accepted the same
+         * way, which keeps a runtime that stores the pair the other way round
+         * readable instead of silently publishing zero. */
+        uint64_t first = ex_row_ref(row), second = ex_row_value(row), slot = 0;
+        if (u_is(first, "BattleCharacterSlotDescription") &&
+            u_is(second, "BattleCharacterSlotModel") &&
+            rr_u64(second + EX_OFF_SLOT_DESC) == first) slot = second;
+        else if (u_is(second, "BattleCharacterSlotDescription") &&
+                 u_is(first, "BattleCharacterSlotModel") &&
+                 rr_u64(first + EX_OFF_SLOT_DESC) == second) slot = first;
+        if (!slot) continue;
         uint64_t data = rr_u64(slot + EX_OFF_SLOT_DATA);
         if (!u_is(data, "BattleCharacterSlotData")) continue;
         uint64_t ref = rr_u64(data + EX_OFF_SLOT_ENTITY_ID);
+        if (!u_is(ref, "BattleEntityIdData") && !u_is(ref, "IntData")) continue;
         int32_t id = -1;
-        if (!PL(ref) || !rr_read(ref + EX_OFF_PRIM_VALUE, &id, sizeof(id))) continue;
-        if (id <= 0 || id != key) continue;   /* empty seat, or the two disagree */
+        if (!rr_read(ref + EX_OFF_PRIM_VALUE, &id, sizeof(id))) continue;
+        if (id < 0) continue;                 /* empty seat keeps its row      */
+        int dup = 0;
+        for (int j = 0; j < count; ++j)
+            if (ids[j] == id) { dup = 1; break; }
+        if (dup) continue;                    /* same seat twice = torn read   */
         if (count < max) ids[count] = id;
         ++count;
     }
@@ -429,6 +498,89 @@ static void ex_cop_scan(uint64_t battle, int* cops, int* slots, int* seats) {
                 if (roles[j].cop) ++*cops;
                 break;
             }
+}
+
+/* ---- --probe: one-shot seat-table dump ---------------------------------
+ *
+ * The same read-only walk ex_slots() does, printed instead of published: the
+ * raw 24-byte entries of the first rows, the class name at each candidate
+ * offset, the value offsets u_dict_value_offset() can find for the three seat
+ * classes, and the counts the production chain resolves. A runtime that lays
+ * `_slots` out differently names itself here instead of publishing a count of
+ * zero, which is what a seat table with no cops looks like.
+ */
+int extras_slots_probe(uint64_t battle_model) {
+    FILE* f = ex_status_open();
+    if (!f) return -1;
+    int is_model = u_is(battle_model, "BattleModel");
+    uint64_t model = is_model ? rr_u64(battle_model + EX_OFF_BATTLE_SLOTS_MODEL) : 0;
+    int is_slots = u_is(model, "BattleCharacterSlotsModel");
+    uint64_t dict = is_slots ? rr_u64(model + EX_OFF_SLOTS_ARRAY) : 0;
+    int cnt = 0, stride = 0;
+    uint64_t entries = 0;
+    if (PL(dict)) u_dict(dict, &cnt, &entries, &stride);
+    fprintf(f, "slots_layout: battle_model=0x%llX is_model=%d model=0x%llX is_slots=%d"
+               " dict=0x%llX cnt=%d stride=%d entries=0x%llX\n",
+            (unsigned long long)battle_model, is_model,
+            (unsigned long long)model, is_slots, (unsigned long long)dict,
+            cnt, stride, (unsigned long long)entries);
+    if (!PL(dict) || !PL(entries) || cnt <= 0) { fclose(f); return -1; }
+
+    fprintf(f, "slots_layout: value_offset SlotModel=0x%X SlotDescription=0x%X SlotData=0x%X\n",
+            u_dict_value_offset(dict, "BattleCharacterSlotModel", 16),
+            u_dict_value_offset(dict, "BattleCharacterSlotDescription", 16),
+            u_dict_value_offset(dict, "BattleCharacterSlotData", 16));
+
+    enum { EX_PROBE_ROWS = 3 };
+    uint8_t raw[EX_PROBE_ROWS * EX_OFF_DICT_STRIDE];
+    int rows = cnt < EX_PROBE_ROWS ? cnt : EX_PROBE_ROWS;
+    if (rr_read(entries, raw, (size_t)rows * EX_OFF_DICT_STRIDE)) {
+        for (int i = 0; i < rows; ++i) {
+            const uint8_t* r = raw + (size_t)i * EX_OFF_DICT_STRIDE;
+            int32_t hash = 0, next = 0;
+            uint32_t d[6];
+            memcpy(&hash, r + EX_OFF_DICT_HASH, 4);
+            memcpy(&next, r + 4, 4);
+            for (int k = 0; k < 6; ++k) memcpy(&d[k], r + (size_t)k * 4, 4);
+            uint64_t key = ex_row_ref(r), slot = ex_row_value(r);
+            /* Prove the pairing instead of trusting the half order: the slot
+             * model carries its own Description back-reference. */
+            int pair = -1;
+            if (PL(key) && PL(slot)) {
+                if (u_is(key, "BattleCharacterSlotDescription") &&
+                    u_is(slot, "BattleCharacterSlotModel") &&
+                    rr_u64(slot + EX_OFF_SLOT_DESC) == key) pair = 0;
+                else if (u_is(slot, "BattleCharacterSlotDescription") &&
+                         u_is(key, "BattleCharacterSlotModel") &&
+                         rr_u64(key + EX_OFF_SLOT_DESC) == slot) pair = 1;
+            }
+            uint64_t model_obj = pair == 1 ? key : slot;
+            uint64_t data = PL(model_obj) ? rr_u64(model_obj + EX_OFF_SLOT_DATA) : 0;
+            uint64_t ref = PL(data) ? rr_u64(data + EX_OFF_SLOT_ENTITY_ID) : 0;
+            int eid = -1;
+            if (PL(ref)) rr_read(ref + EX_OFF_PRIM_VALUE, &eid, sizeof(eid));
+            char kc[64], vc[64], dc[64];
+            ex_cls_name(key, kc, sizeof(kc));
+            ex_cls_name(slot, vc, sizeof(vc));
+            ex_cls_name(data, dc, sizeof(dc));
+            fprintf(f, "slots_layout: row=%d hash=%d next=%d dwords=%08X %08X %08X %08X %08X %08X"
+                       " key=0x%llX (%s) slot=0x%llX (%s) pair=%d"
+                       " data=0x%llX (%s) eid=%d\n",
+                    i, hash, next, d[0], d[1], d[2], d[3], d[4], d[5],
+                    (unsigned long long)key, kc, (unsigned long long)slot, vc, pair,
+                    (unsigned long long)data, dc, eid);
+        }
+    }
+
+    int cops = 0, slots = 0, seats = 0;
+    ex_cop_scan(battle_model, &cops, &slots, &seats);
+    fprintf(f, "slots_layout: cops=%d occupied=%d seats=%d free=%d\n",
+            cops, slots, seats, seats > slots ? seats - slots : 0);
+    fclose(f);
+    /* Also emit the production line the overlay would append (its 1 s throttle is
+     * per process, so a one-shot dump always writes exactly one). */
+    ex_slots_debug(battle_model);
+    return slots;
 }
 /* ---- Feature 2: world items -------------------------------------------- */
 

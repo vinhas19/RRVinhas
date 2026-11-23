@@ -45,8 +45,14 @@ extern "C" {
 #define EX_OFF_DICT_USED            U_DICT_COUNT    /* 0x020 used slots     */
 #define EX_OFF_DICT_STRIDE          0x18u
 #define EX_OFF_DICT_HASH            0x00u           /* < 0 marks a freed slot */
-#define EX_OFF_DICT_KEY             0x08u           /* int32 entity id      */
+#define EX_OFF_DICT_KEY             0x08u           /* int32 key of Dictionary<int, T> */
 #define EX_OFF_DICT_VALUE           0x10u
+/* The seat table's key is a reference, not an id: _slots is
+ * Dictionary<BattleCharacterSlotDescription, BattleCharacterSlotModel>
+ * (offsets/robrun_sdk_offsets.json), so the key occupies the same 0x08 offset
+ * as an int32 key but is 8 bytes wide and must be class-checked. rr_hiding.h
+ * reads the same table the same way. */
+#define EX_OFF_SLOT_KEY             EX_OFF_DICT_KEY
 
 /* --- WorldEntitiesModel collections -------------------------------------
  * src: 17/11/2026 dump; identical to the generated dump-20261112 values used
@@ -167,6 +173,13 @@ int extras_insta_tick(uint64_t battle, uint64_t updater);
 
 /* Drop the publication (detach, world change) and stop the instant loot loop. */
 void extras_reset(void);
+
+/* Read-only seat-table dump for --probe. Walks the same chain ex_slots() uses
+ * and appends the raw entries, the class name at every candidate offset and the
+ * resolved counts to status.log beside the exe. Returns the number of occupied
+ * seats, or -1 when the table cannot be read. Makes no writes and publishes
+ * nothing. */
+int extras_slots_probe(uint64_t battle_model);
 
 #ifdef __cplusplus
 }

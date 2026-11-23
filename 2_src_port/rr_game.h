@@ -99,6 +99,10 @@ typedef struct RR_CAMERA {
 int  game_init(void);
 /* Read-only diagnostic for the optional UnityEntry discovery path. */
 int game_entry_probe(uint64_t* world, uint64_t* battle, uint64_t* camera);
+/* The BattleModel the current scene resolved (BattleModel, not the entities
+ * model at +0x90), or 0 when no chain is up. Read-only; --probe uses it to dump
+ * the seat table without the background worker. */
+uint64_t game_battle_model(void);
 void game_gom_diag(FILE* out);
 void game_chain_diag(FILE* out);
 void game_gom_list_diag(FILE* out);

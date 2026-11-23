@@ -1103,6 +1103,15 @@ static int run_selftest(void) {
           EX_OFF_DICT_STRIDE == 0x18u && EX_OFF_WE_HIDE_OBJECTS == 0x1B0u &&
           EX_OFF_HIDE_DESC_POS == 0x30u,
           "extras offsets match the 17/11/2026 table");
+    /* The seat table is Dictionary<BattleCharacterSlotDescription,
+     * BattleCharacterSlotModel>: its key sits at the int-key offset but is an
+     * 8-byte reference, and the slot model keeps _data_1 at +0x10 and its
+     * Description at +0x18 -- the identities ex_slots() proves before it counts a
+     * seat. The boxed EntityId int is at +0x18 of the IPrimitiveData reference. */
+    check(EX_OFF_SLOT_KEY == 0x08u && EX_OFF_SLOT_DATA == 0x10u &&
+          EX_OFF_SLOT_DESC == 0x18u && EX_OFF_SLOT_ENTITY_ID == 0x20u &&
+          EX_OFF_PRIM_VALUE == 0x18u,
+          "seat table key/value are the reference pair rr_hiding.h reads");
     {
         static EXTRA_WORLD_ITEM extra_items[8];
         extras_reset();
@@ -1147,6 +1156,37 @@ static int run_selftest(void) {
         }
         live->debug_slots = saved;
         check(found, "slots debug writes a status.log line with no battle");
+    }
+
+    /* 2b1b. the --probe layout dump: an unknown battle must be refused instead of
+     * reading through a null anchor, and the refusal has to land in status.log so
+     * a probe run without a lobby still says why it printed nothing. */
+    {
+        check(extras_slots_probe(0) == -1, "slots layout dump refuses an unknown battle");
+        int found = 0;
+        char dpath[MAX_PATH];
+        DWORD dlen = GetModuleFileNameA(NULL, dpath, MAX_PATH);
+        char* dslash = dlen ? strrchr(dpath, '\\') : NULL;
+        if (dslash) {
+            *(dslash + 1) = 0;
+            strncat(dpath, "status.log", MAX_PATH - strlen(dpath) - 1);
+            FILE* df = fopen(dpath, "r");
+            if (df) {
+                char tail[4096];
+                tail[0] = 0;
+                if (fseek(df, 0, SEEK_END) == 0) {
+                    long size = ftell(df);
+                    long start = size > (long)sizeof(tail) - 1 ? size - (long)sizeof(tail) + 1 : 0;
+                    if (size > 0 && fseek(df, start, SEEK_SET) == 0) {
+                        size_t got = fread(tail, 1, sizeof(tail) - 1, df);
+                        tail[got] = 0;
+                        found = strstr(tail, "slots_layout: battle_model=0x0 is_model=0") != NULL;
+                    }
+                }
+                fclose(df);
+            }
+        }
+        check(found, "slots layout dump records the unknown anchor in status.log");
     }
 
     /* 2b2. cop HUD: the exact bytes the overlay draws, and the three gates
@@ -1364,6 +1404,12 @@ static int run_probe(void) {
     out("[probe] status: %s\n", st);
     out("[probe] prim offset=0x%X dict offset=0x%X\n",
            game_prim_offset(), game_dict_offset());
+
+    /* Read-only seat-table dump for the cop counter: the entries of the first
+     * rows, the class each candidate offset points at, and the counts the
+     * production chain resolves. Written to status.log beside this exe. */
+    out("[probe] slots: occupied=%d (layout in status.log)\n",
+        extras_slots_probe(game_battle_model()));
 
     static RR_PLAYER players[RR_MAX_PLAYERS];
     RR_CAMERA cam;

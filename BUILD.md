@@ -113,16 +113,34 @@ of zero, which looks exactly like a lobby with no seats. To tell the two apart,
 beside the overlay. Each line prints the link the reader follows -- `battle`,
 `model` (`battle + 0x4D0`), `is_slots`, `dict` (`model + 0x10`), `used`
 (`dict + 0x20`), then the first used row's `first_key`, `first_eid`,
-`first_is_slot` and `first_is_data` -- followed by the raw addresses behind them
-(`row`, `hash`, `key_q`, `slot`, `data`, `ref`, `desc`, `entries`, `cnt`,
-`stride`) and the class name each pointer actually points at. The first link
-that reads as 0, or whose class name does not match, is the broken one:
-`model_cls` says what `battle + 0x4D0` really points at, and `key_q` shows the
-full 8 bytes of the dictionary key, so a table keyed by an object reference is
-visible as a heap pointer instead of a small entity id. The line is written
-before the refresh's "nothing consumes this" early return, so the switch reports
-even with every feature off. Leave it off for normal use: at one line per second
-`status.log` grows without bound.
+`first_is_slot`, `first_is_data`, `first_key_is_desc` and `pair` -- followed by
+the raw addresses behind them (`row`, `hash`, `key_q`, `slot`, `data`, `ref`,
+`desc`, `entries`, `cnt`, `stride`) and the class name each pointer actually
+points at (`battle_cls`, `model_cls`, `key_cls`, `slot_cls`, `data_cls`).
+
+`_slots` is `Dictionary<BattleCharacterSlotDescription, BattleCharacterSlotModel>`
+(`offsets/robrun_sdk_offsets.json`), so an entry's two halves are **object
+references**: `key_q` (the 8 bytes at `row + 0x08`) is the seat's description and
+`slot` (`row + 0x10`) is its `BattleCharacterSlotModel`. `first_key` is only the
+low half of that reference and is never compared with an entity id; the id lives
+in `BattleCharacterSlotData.EntityId` (`slot + 0x10`, then `+0x20`, then the boxed
+int at `+0x18`). The pair is accepted only when the slot model's own `Description`
+(`slot + 0x18`) is the description half -- `first_key_is_desc=1 pair=0` is the
+order the dump declares, `pair=1` the same pair stored the other way round, and
+`pair=-1` means neither identity held, which is the broken-link case. Reading the
+key as an `int32` entity id (what the counter used to do) can never match, so the
+first link that reads as 0, or whose class name does not match, is the broken
+one. The line is written before the refresh's "nothing consumes this" early
+return, so the switch reports even with every feature off. Leave it off for
+normal use: at one line per second `status.log` grows without bound.
+
+`--probe` prints the same table once, without the overlay: `extras_slots_probe()`
+appends `slots_layout:` lines to `status.log` beside the exe with the raw
+`dwords` of the first three rows, `key`/`slot` with their class names, the
+`pair` it accepted, `eid`, the value offsets `u_dict_value_offset()` can find for
+the three seat classes, and finally `cops=`, `occupied=`, `seats=` and `free=`.
+It ends with the production `slots_debug:` line, so `--probe` alone diagnoses the
+counter without leaving `debug_slots` on for a session.
 
 Instant loot is the module's only writer. While the World tab switch is on, a
 250 ms loop (`extras_insta_tick()`) zeroes the cell-border, shine and icon

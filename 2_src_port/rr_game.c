@@ -864,6 +864,12 @@ static uint64_t typeinfo_find_named(const char* want, FILE* f) {
     return 0;
 }
 
+/* The BattleModel the worker keeps for the current scene. --probe has no worker
+ * loop, so it reads the anchor game_init() resolved instead of scanning again. */
+uint64_t game_battle_model(void) {
+    return g_battle_model;
+}
+
 void game_objlist_diag(FILE* f) {
     if (!f) return;
     uint64_t up = 0; uint32_t us = 0;
